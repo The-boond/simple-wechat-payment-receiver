@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+config.json
+*.secret.json
+logs/
+spool/
+captures/
+*.log
+.env
+

@@ -1,0 +1,18 @@
+[project]
+name = "simple-wechat-payment-receiver"
+version = "1.0.0"
+description = "Configurable Windows/Linux WeChat desktop payment notification receiver"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Theboond"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux"
+]
+
+[tool.unittest]
+start-directory = "tests"
+
