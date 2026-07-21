@@ -1,0 +1,28 @@
+[Unit]
+Description=Simple WeChat Payment Receiver (Linux)
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=/opt/simple-wechat-payment-receiver
+EnvironmentFile=/etc/simple-wechat-payment-receiver.env
+Environment=DISPLAY=:88
+ExecStart=/usr/bin/python3 /opt/simple-wechat-payment-receiver/linux_agent.py --config /opt/simple-wechat-payment-receiver/config.json
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/simple-wechat-payment-receiver/spool /opt/simple-wechat-payment-receiver/captures
+MemoryHigh=180M
+MemoryMax=300M
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
+
