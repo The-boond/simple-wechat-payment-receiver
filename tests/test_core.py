@@ -26,7 +26,6 @@ def base_config() -> dict:
         "channel": {"id": "7821", "provider": "wxpay"},
         "parser": {"timezone": "Asia/Shanghai", "max_event_age_seconds": 180},
         "linux": {"trigger_files": ["/tmp/example.db-wal"]},
-        "windows": {"trigger_files": ["C:\\example.db-wal"]},
     }
 
 
@@ -137,4 +136,3 @@ class StorageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
