@@ -59,6 +59,18 @@ class ReceiptParserTests(unittest.TestCase):
         self.assertIsNone(event)
         self.assertTrue(reason.startswith("stale"))
 
+    def test_parses_receipt_when_ocr_drops_amount_label(self) -> None:
+        text = "经营码收款到账通知\n07月22日 22:41\n¥34.80"
+        event, _ = self.parser.parse(
+            text,
+            trigger_time=int(datetime(2026, 7, 22, 22, 42, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+            trigger_signature="wal:1:4",
+            source="test",
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual("34.80", event.amount)
+
     def test_event_id_changes_with_trigger_signature(self) -> None:
         one, _ = self.parser.parse(self.text, trigger_time=self.trigger, trigger_signature="a", source="test")
         two, _ = self.parser.parse(self.text, trigger_time=self.trigger, trigger_signature="b", source="test")
