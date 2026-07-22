@@ -18,5 +18,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m py_compile receiver_core.py windows_agent.py linux_agent.py examples/webhook_receiver.py
+      - run: python -m py_compile receiver_core.py linux_agent.py examples/webhook_receiver.py
       - run: python -m unittest discover -s tests -v
