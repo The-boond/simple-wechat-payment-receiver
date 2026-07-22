@@ -1,27 +1,25 @@
 # 简陋的微信收款接收器
 
-一个可自行配置的 Windows / Linux 微信桌面收款消息采集器。它监听微信业务消息数据库的 WAL 变化，仅在新变化发生后截图并 OCR“微信收款助手”中的最新收款卡片，然后把标准化事件通过带时间戳的 HMAC 请求发送到你的业务接口。
+一个可自行配置的 Linux 微信桌面收款消息采集器。它监听微信业务消息数据库的 WAL 变化，仅在新变化发生后截图并 OCR“微信收款助手”中的最新收款卡片，然后把标准化事件通过带时间戳的 HMAC 请求发送到你的业务接口。
 
-> 这不是微信支付官方商户 API。软件采集模式需要一台持续登录微信桌面客户端的 Windows 或 Linux 设备。生产订单的匹配、完成、退款和金额校验仍应由你的服务端实现。
+> 这不是微信支付官方商户 API。软件采集模式需要一台持续登录微信 Linux 桌面客户端的设备。生产订单的匹配、完成、退款和金额校验仍应由你的服务端实现。
 
 ## 为什么创建这个项目
 
 一些机场面板原模板带有在线支付和订单状态展示，但部分刚起步的运营者暂时没有微信支付商户接口资质，同时又希望自己的用户付款后，后台能够实时看到收款事件和订单结算状态。
 
-这个项目因此诞生：它把自有微信收款账号中“微信收款助手”的到账消息转换为统一事件，再发送到运营者自己的订单接口。只要按实际环境正确配置 WAL 路径、微信窗口、OCR、通道 ID、Webhook 地址和共享密钥，Windows 或 Linux 设备都可以承担监听任务，实现与当前部署相同的实时收款提示、订单匹配和结算状态展示。
+这个项目因此诞生：它把自有微信收款账号中“微信收款助手”的到账消息转换为统一事件，再发送到运营者自己的订单接口。只要按实际环境正确配置 WAL 路径、微信窗口、OCR、通道 ID、Webhook 地址和共享密钥，Linux 设备即可承担监听任务，实现实时收款提示、订单匹配和结算状态展示。
 
 项目定位是一个简陋、透明、便于自行修改的收款消息桥接器。它只负责采集和上报事件；订单匹配、金额校验、结算、退款及异常处理仍由使用者自己的服务端完成。
 
 ## 功能
 
-- Windows：业务消息 WAL 触发 + Windows OCR。
 - Linux：业务消息 WAL 触发 + X11 截图 + Tesseract OCR。
 - 启动只建立基线，不重放历史收款记录。
 - 明确金额、月日和时分必须接近 WAL 触发时间。
 - 多次 OCR 尝试与可配置窗口位置，适应不同微信界面布局。
 - HMAC-SHA256 签名、事件 ID、持久 spool、指数退避和幂等重试。
-- 默认不保存完整 OCR 文本、截图或所有系统通知。
-- Windows 通知读取、窗口恢复均为显式可选配置。
+- 默认不保存完整 OCR 文本或截图。
 - 附带一个最小 HMAC Webhook 接收示例。
 
 ## 已移除的部署专用内容
@@ -31,18 +29,15 @@
 - 真实域名、Token、订单号、用户 ID、微信账号目录和支付记录。
 - 生产数据库、XBoard 或其他站点的直接改单逻辑。
 - 一次性补单、硬编码金额/时间和远程服务器运维命令。
-- 默认读取所有 Windows 通知或默认操控隐藏窗口的行为。
+- Windows 客户端检测、通知读取和窗口操作代码。
 - 真实截图、OCR 日志、spool 和登录数据。
 
 ## 目录
 
 ```text
 receiver_core.py                 公共事件、解析、签名、spool、重试
-windows_agent.py                 Windows Agent
 linux_agent.py                   Linux Agent
-configs/windows.example.json     Windows 完整配置示例
 configs/linux.example.json       Linux 完整配置示例
-scripts/windows/wechat_ocr.ps1   Windows allowlist OCR
 examples/webhook_receiver.py     最小签名接收示例
 deploy/linux/                    Linux systemd 示例
 tests/                           自动化测试
@@ -91,8 +86,6 @@ X-Bridge-Signature: HMAC_SHA256(secret, timestamp + "." + raw_json_body)
 
 ```bash
 cp configs/linux.example.json config.json
-# Windows PowerShell:
-# Copy-Item configs\windows.example.json config.json
 ```
 
 必须修改：
@@ -104,7 +97,6 @@ cp configs/linux.example.json config.json
 | `agent.id` | 每台采集器的唯一 ID |
 | `channel.id` | 你的业务通道 ID |
 | `*.trigger_files` | 当前微信账号的 `biz_message_0.db-wal` 路径或 glob |
-| Windows `window_title_regex` | 当前微信窗口标题表达式 |
 | Linux `display` | 微信所在 X11 DISPLAY |
 | Linux `window_name_regex` | 收款助手独立窗口标题表达式 |
 
@@ -118,7 +110,6 @@ cp configs/linux.example.json config.json
 - `trigger_quiet_seconds`：WAL 最后一次变化后的静默等待，避免文件仍在写入时过早 OCR
 - `capture_attempts` 的延迟和滚动位置
 - OCR 命令、语言、PSM、截图保留策略
-- Windows 进程名、通知 allowlist、窗口恢复开关
 
 ## 共享密钥
 
@@ -134,45 +125,7 @@ Linux：
 export WECHAT_RECEIVER_TOKEN='你的随机密钥'
 ```
 
-Windows PowerShell（当前会话）：
-
-```powershell
-$env:WECHAT_RECEIVER_TOKEN = '你的随机密钥'
-```
-
 配置文件内明文 Token 默认不会被采用。若本地测试确实需要，可显式设置 `bridge.allow_inline_secret=true` 和 `bridge.token`，并确保文件没有提交。
-
-## Windows
-
-要求：
-
-- Windows 10/11
-- Python 3.10+
-- 微信 4.x
-- Windows 中文 OCR 语言包
-
-1. 打开“微信收款助手”，确认最新收款卡片可见。
-2. 找到当前账号的 `biz_message_0.db-wal`，填写 `windows.trigger_files`。
-3. 默认保持 `include_notifications=false`、`allow_window_restore=false`。
-4. 先检查配置：
-
-```powershell
-py -3 .\windows_agent.py --config .\config.json --once
-```
-
-5. 启动：
-
-```powershell
-.\scripts\windows\run-agent.ps1 -Config .\config.json
-```
-
-托盘状态下需要自动恢复窗口时，再启用：
-
-```json
-"allow_window_restore": true
-```
-
-该选项只处理配置进程和标题 allowlist 匹配的窗口，并在 OCR 后恢复原来的最小化/隐藏状态。
 
 ## Linux
 
@@ -235,7 +188,7 @@ python3 examples/webhook_receiver.py
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile receiver_core.py windows_agent.py linux_agent.py examples/webhook_receiver.py
+python -m py_compile receiver_core.py linux_agent.py examples/webhook_receiver.py
 ```
 
 ## 常见问题
@@ -254,7 +207,7 @@ python -m py_compile receiver_core.py windows_agent.py linux_agent.py examples/w
 
 ### 是否需要一直开自己的电脑
 
-采集设备需要保持微信登录；可放在持续运行的 Windows 主机或 Linux 云服务器。SSH/VNC 断开后，systemd 服务仍可运行。
+采集设备需要保持微信登录；可放在持续运行的 Linux 主机或云服务器。SSH/VNC 断开后，systemd 服务仍可运行。
 
 ## License
 
