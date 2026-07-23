@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 
 LOG = logging.getLogger("wechat-payment-receiver")
+OCR_CAPTURE_SEPARATOR = "\n<<<WECHAT_CAPTURE_BREAK>>>\n"
 
 
 DEFAULT_RECEIPT_PATTERN = (
@@ -183,6 +184,49 @@ class ReceiptParser:
                 candidates.append((self._timestamp(match, trigger_time), canonical_money(match.group("amount"))))
             except (ValueError, OverflowError):
                 continue
+        if not candidates and OCR_CAPTURE_SEPARATOR in text:
+            header_re = re.compile(
+                r"(?:经营码)?收款到账通知.{0,160}?"
+                r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
+                r"(?P<hour>\d{1,2}):(?P<minute>\d{2})",
+                re.IGNORECASE,
+            )
+            dated_amount_re = re.compile(
+                r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
+                r"(?P<hour>\d{1,2}):(?P<minute>\d{2}).{0,260}?"
+                r"(?:收款金额[￥¥YV]?|[￥¥YV])"
+                r"(?P<amount>[0-9Oo]+[.．。][0-9Oo]{1,2})",
+                re.IGNORECASE,
+            )
+            header_stamps: list[tuple[int, int]] = []
+            dated_amounts: list[tuple[int, int, str]] = []
+            for index, segment in enumerate(text.split(OCR_CAPTURE_SEPARATOR)):
+                normalized_segment = normalize_ocr_text(segment)
+                for match in header_re.finditer(normalized_segment):
+                    try:
+                        header_stamps.append(
+                            (index, self._timestamp(match, trigger_time))
+                        )
+                    except (ValueError, OverflowError):
+                        continue
+                for match in dated_amount_re.finditer(normalized_segment):
+                    try:
+                        dated_amounts.append(
+                            (
+                                index,
+                                self._timestamp(match, trigger_time),
+                                canonical_money(match.group("amount")),
+                            )
+                        )
+                    except (ValueError, OverflowError):
+                        continue
+            for amount_index, occurred_at, amount in dated_amounts:
+                if any(
+                    header_time == occurred_at
+                    and abs(header_index - amount_index) <= 1
+                    for header_index, header_time in header_stamps
+                ):
+                    candidates.append((occurred_at, amount))
         if not candidates:
             return None, "pattern_not_found"
         occurred_at, amount = min(candidates, key=lambda row: abs(trigger_time - row[0]))

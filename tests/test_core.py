@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from receiver_core import (
     EventSpool,
+    OCR_CAPTURE_SEPARATOR,
     PaymentEvent,
     ReceiptDedupe,
     ReceiptParser,
@@ -70,6 +71,24 @@ class ReceiptParserTests(unittest.TestCase):
         self.assertIsNotNone(event)
         assert event is not None
         self.assertEqual("34.80", event.amount)
+
+    def test_stitches_partial_adjacent_captures(self) -> None:
+        text = OCR_CAPTURE_SEPARATOR.join(
+            [
+                "¥29.90 收款店铺 是四苦不是四喜 店铺今日收款 124.30元",
+                "乱码标题 07月23日 13:10 乱码标签 ¥29.90 收款店铺",
+                "经营码收款到账通知 07月23日 13:10",
+            ]
+        )
+        event, _ = self.parser.parse(
+            text,
+            trigger_time=int(datetime(2026, 7, 23, 13, 10, 50, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+            trigger_signature="wal:1:5",
+            source="test",
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual("29.90", event.amount)
 
     def test_event_id_changes_with_trigger_signature(self) -> None:
         one, _ = self.parser.parse(self.text, trigger_time=self.trigger, trigger_signature="a", source="test")

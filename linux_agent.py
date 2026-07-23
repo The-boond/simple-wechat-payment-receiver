@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 from receiver_core import (
     AgentRuntime,
+    OCR_CAPTURE_SEPARATOR,
     ReceiptParser,
     discover_trigger_files,
     file_signature,
@@ -38,6 +39,10 @@ class LinuxCapture:
         self.ocr_language = str(config.get("ocr_language") or "chi_sim+eng")
         self.ocr_psm = int(config.get("ocr_psm", 6))
         self.scroll_down_clicks = max(0, int(config.get("scroll_down_clicks", 40)))
+        self.window_width = max(620, int(config.get("window_width", 720)))
+        self.window_height = max(660, int(config.get("window_height", 860)))
+        self.window_x = max(0, int(config.get("window_x", 0)))
+        self.window_y = max(0, int(config.get("window_y", 0)))
         self.keep_screenshots = config.get("keep_screenshots") is True
         self.capture_dir = resolve_path(str(config.get("capture_dir") or "captures"), full_config)
         self.capture_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +70,14 @@ class LinuxCapture:
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
         screenshot = self.capture_dir / f"receipt-{stamp}.png"
         self._run([self.window_probe, "windowactivate", "--sync", window_id], timeout=10)
+        self._run([
+            self.window_probe, "windowsize", "--sync", window_id,
+            str(self.window_width), str(self.window_height),
+        ], timeout=10)
+        self._run([
+            self.window_probe, "windowmove", "--sync", window_id,
+            str(self.window_x), str(self.window_y),
+        ], timeout=10)
         self._run([self.window_probe, "mousemove", "--window", window_id, "300", "350"], timeout=10)
         if self.scroll_down_clicks:
             self._run([
@@ -155,6 +168,7 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
                     "index": 0,
                     "started": now_mono,
                     "not_before": now_mono + trigger_quiet_seconds,
+                    "texts": [],
                 }
             else:
                 active["wall"] = wall
@@ -174,8 +188,9 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
                 reason = "capture_failed"
                 if captured:
                     text, window_id = captured
+                    active["texts"].append(text)
                     event, receipt_key = parser.parse(
-                        text,
+                        OCR_CAPTURE_SEPARATOR.join(active["texts"]),
                         trigger_time=int(active["wall"]),
                         trigger_signature=str(active["signature"]),
                         source="wechat-linux-wal-ocr",
