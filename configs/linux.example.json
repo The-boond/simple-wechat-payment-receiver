@@ -23,7 +23,7 @@
     "max_event_age_seconds": 180,
     "max_future_seconds": 60,
     "include_raw_ocr_text": false,
-    "receipt_pattern": "(?:经营码)?收款到账通知.{0,200}?(?P<month>\\d{1,2})月(?P<day>\\d{1,2})日(?P<hour>\\d{1,2}):(?P<minute>\\d{2}).{0,300}?收款金额[￥¥YV]?(?P<amount>[0-9Oo]+[.．。][0-9Oo]{1,2})"
+    "receipt_pattern": "(?:经营码)?收款到账通知.{0,200}?(?P<month>\\d{1,2})月(?P<day>\\d{1,2})日(?P<hour>\\d{1,2}):(?P<minute>\\d{2}).{0,300}?(?:收款金额)?[￥¥YV]?(?P<amount>[0-9Oo]+[.．。][0-9Oo]{1,2})"
   },
   "linux": {
     "trigger_quiet_seconds": 0.8,
