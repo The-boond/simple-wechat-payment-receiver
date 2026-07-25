@@ -168,6 +168,23 @@ class ReceiptParser:
             stamp = int(datetime(now.year - 1, month, day, hour, minute, tzinfo=self.timezone).timestamp())
         return stamp
 
+    def _clock_timestamp(self, hour: int, minute: int, trigger_time: int) -> int:
+        """Resolve a service-account card's HH:MM clock to today or yesterday."""
+        now = datetime.fromtimestamp(trigger_time, self.timezone)
+        stamp = int(
+            datetime(
+                now.year,
+                now.month,
+                now.day,
+                hour,
+                minute,
+                tzinfo=self.timezone,
+            ).timestamp()
+        )
+        if stamp > trigger_time + self.max_future:
+            stamp -= 86400
+        return stamp
+
     def parse_all(
         self,
         text: str,
@@ -184,6 +201,45 @@ class ReceiptParser:
                 candidates.append((self._timestamp(match, trigger_time), canonical_money(match.group("amount"))))
             except (ValueError, OverflowError):
                 continue
+
+        # Merchant QR receipts arrive in the "微信支付商家助手" service-account
+        # conversation. Its card exposes a chat clock (HH:MM), "收款通知", and
+        # the amount, but not the dated "经营码收款到账通知" header.
+        merchant_receipt_re = re.compile(
+            r"收款通知.{0,220}?"
+            r"(?:收款金额)?[￥¥YV]?"
+            r"(?P<amount>[0-9Oo]+[.．。][0-9Oo]{1,2})",
+            re.IGNORECASE,
+        )
+        merchant_clock_re = re.compile(
+            r"(?<!\d)(?P<hour>\d{1,2}):(?P<minute>\d{2})(?!\d)"
+        )
+        # Keep OCR scroll captures independent so a clock from one screenshot
+        # is never joined to a receipt card in the next screenshot.
+        for segment in text.split(OCR_CAPTURE_SEPARATOR):
+            normalized_segment = normalize_ocr_text(segment)
+            for receipt in merchant_receipt_re.finditer(normalized_segment):
+                prefix = normalized_segment[
+                    max(0, receipt.start() - 320) : receipt.start()
+                ]
+                clocks = list(merchant_clock_re.finditer(prefix))
+                if not clocks:
+                    continue
+                clock = clocks[-1]
+                try:
+                    candidates.append(
+                        (
+                            self._clock_timestamp(
+                                int(clock.group("hour")),
+                                int(clock.group("minute")),
+                                trigger_time,
+                            ),
+                            canonical_money(receipt.group("amount")),
+                        )
+                    )
+                except (ValueError, OverflowError):
+                    continue
+
         if OCR_CAPTURE_SEPARATOR in text:
             header_re = re.compile(
                 r"(?:经营码)?收款到账通知.{0,160}?"

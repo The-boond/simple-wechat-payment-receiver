@@ -123,6 +123,103 @@ class ReceiptParserTests(unittest.TestCase):
         )
         self.assertEqual(1, len(events))
 
+    def test_parses_merchant_assistant_time_only_receipt(self) -> None:
+        trigger = int(
+            datetime(
+                2026,
+                7,
+                26,
+                3,
+                14,
+                20,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ).timestamp()
+        )
+        event, reason = self.parser.parse(
+            "03:14 收款通知 ¥192.58 商品名称：店铺",
+            trigger_time=trigger,
+            trigger_signature="merchant",
+            source="test",
+        )
+        self.assertEqual("wxpay|7821|192.58|1785006840", reason)
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual("192.58", event.amount)
+        self.assertEqual(1785006840, event.occurred_at)
+
+    def test_merchant_receipt_uses_nearest_preceding_clock(self) -> None:
+        trigger = int(
+            datetime(
+                2026,
+                7,
+                26,
+                3,
+                14,
+                20,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ).timestamp()
+        )
+        event, _ = self.parser.parse(
+            "02:14 员工账号成功创建通知 03:14 收款通知 "
+            "¥192.58 商品名称：店铺 03:23 入驻申请进展通知",
+            trigger_time=trigger,
+            trigger_signature="merchant-nearest",
+            source="test",
+        )
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(1785006840, event.occurred_at)
+
+    def test_merchant_clock_does_not_cross_capture_boundary(self) -> None:
+        trigger = int(
+            datetime(
+                2026,
+                7,
+                26,
+                3,
+                30,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ).timestamp()
+        )
+        events, reason = self.parser.parse_all(
+            "03:23 入驻申请进展通知"
+            + OCR_CAPTURE_SEPARATOR
+            + "03:14 收款通知 ¥192.58 商品名称：店铺",
+            trigger_time=trigger,
+            trigger_signature="merchant-boundary",
+            source="test",
+            ignore_freshness=True,
+        )
+        self.assertEqual("", reason)
+        self.assertEqual(1, len(events))
+        self.assertEqual(1785006840, events[0][0].occurred_at)
+
+    def test_merchant_same_amount_different_minutes_stays_distinct(self) -> None:
+        trigger = int(
+            datetime(
+                2026,
+                7,
+                26,
+                3,
+                14,
+                20,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ).timestamp()
+        )
+        events, reason = self.parser.parse_all(
+            "03:02 收款通知 ¥192.58 商品名称：店铺 "
+            "03:14 收款通知 ¥192.58 商品名称：店铺",
+            trigger_time=trigger,
+            trigger_signature="merchant-batch",
+            source="test",
+            ignore_freshness=True,
+        )
+        self.assertEqual("", reason)
+        self.assertEqual(
+            [1785006120, 1785006840],
+            [event.occurred_at for event, _ in events],
+        )
+
 
 class ConfigTests(unittest.TestCase):
     def test_requires_https_for_remote_hosts(self) -> None:

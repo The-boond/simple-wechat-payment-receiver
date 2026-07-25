@@ -33,7 +33,10 @@
       "/home/YOUR_USER/xwechat_files/*/db_storage/message/biz_message_0.db-wal"
     ],
     "display": ":88",
-    "window_name_regex": "^微信收款助手$",
+    "window_name_regexes": [
+      "^微信支付商家助手$",
+      "^微信收款助手$"
+    ],
     "window_probe": "xdotool",
     "capture_tool": "import",
     "ocr_tool": "tesseract",

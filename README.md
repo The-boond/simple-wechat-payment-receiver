@@ -100,7 +100,7 @@ cp configs/linux.example.json config.json
 | `channel.id` | 你的业务通道 ID |
 | `*.trigger_files` | 当前微信账号的 `biz_message_0.db-wal` 路径或 glob |
 | Linux `display` | 微信所在 X11 DISPLAY |
-| Linux `window_name_regex` | 收款助手独立窗口标题表达式 |
+| Linux `window_name_regexes` | 按优先级排列的独立收款窗口标题表达式 |
 
 常用可调项：
 
@@ -114,6 +114,12 @@ cp configs/linux.example.json config.json
 - `trigger_quiet_seconds`：WAL 最后一次变化后的静默等待，避免文件仍在写入时过早 OCR
 - `capture_attempts` 的延迟和滚动位置
 - OCR 命令、语言、PSM、截图保留策略
+
+`window_name_regexes` 可同时配置多个窗口；旧版单值
+`window_name_regex` 仍兼容。内置解析器同时支持：
+
+- `微信收款助手` 的“经营码收款到账通知 + 完整日期时间”卡片。
+- `微信支付商家助手` 的“HH:MM + 收款通知 + 金额”卡片。
 
 ## 共享密钥
 
@@ -140,7 +146,10 @@ sudo apt-get install -y python3 tesseract-ocr tesseract-ocr-chi-sim \
   imagemagick xdotool wmctrl inotify-tools fonts-noto-cjk
 ```
 
-要求微信运行在持久 X11 会话（真实桌面或 Xvfb），并提前打开独立的“微信收款助手”窗口。
+要求微信运行在持久 X11 会话（真实桌面或 Xvfb），并提前打开配置中的
+独立窗口。对于“微信支付商家助手”，可在微信的服务号列表中双击该会话，
+使其成为标题为 `微信支付商家助手` 的独立窗口。保留旧二维码期间，可同时
+打开 `微信支付商家助手` 和 `微信收款助手`，Agent 会按配置顺序逐个采集。
 
 检查配置：
 
@@ -160,7 +169,7 @@ python3 linux_agent.py --config config.json
 
 每次截图后，Agent 会解析当前累计 OCR 文本中的全部新到账卡片。识别出的事件会先写入持久 spool，并在下一张补扫截图前立即发送；相邻滚动位置重复出现的同一张卡片会被去重。
 
-微信收款助手通常只显示到分钟。接收端如果可能同时存在多笔同价订单，应给收银台金额分配不同的分币尾数，并要求付款人严格支付页面显示的完整金额。例如同为 `¥100.00` 的订单可依次显示为 `¥100.00`、`¥100.01`、`¥100.02`。尾数分配必须使用数据库事务或唯一约束。
+微信到账卡片通常只显示到分钟。接收端如果可能同时存在多笔同价订单，应给收银台金额分配不同的分币尾数，并要求付款人严格支付页面显示的完整金额。例如同为 `¥100.00` 的订单可依次显示为 `¥100.00`、`¥100.01`、`¥100.02`。尾数分配必须使用数据库事务或唯一约束。
 
 失败事件不会覆盖新到账识别。`no_candidate` 达到配置的保留时间后会从 pending 移入 rejected，并生成对应的 `.reason.txt`；网络故障等其他失败按 `retry_max_age_seconds` 保留。
 
@@ -207,7 +216,7 @@ python -m py_compile receiver_core.py linux_agent.py examples/webhook_receiver.p
 
 ### 只有 heartbeat
 
-检查 WAL 路径是否存在、微信是否已登录、收款助手窗口是否打开。
+检查 WAL 路径是否存在、微信是否已登录、配置中的收款窗口是否已作为独立窗口打开。
 
 ### 有 trigger，没有 candidate
 

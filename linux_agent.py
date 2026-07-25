@@ -32,7 +32,25 @@ LOG = logging.getLogger("wechat-payment-receiver.linux")
 class LinuxCapture:
     def __init__(self, config: Mapping[str, Any], full_config: Mapping[str, Any]):
         self.display = str(config.get("display") or ":88")
-        self.window_name_regex = str(config.get("window_name_regex") or "^微信收款助手$")
+        raw_window_regexes = config.get("window_name_regexes")
+        if isinstance(raw_window_regexes, list):
+            window_regexes = [
+                str(value).strip()
+                for value in raw_window_regexes
+                if str(value).strip()
+            ]
+        else:
+            window_regexes = []
+        if not window_regexes:
+            window_regexes = [
+                str(
+                    config.get("window_name_regex")
+                    or "^微信收款助手$"
+                ).strip()
+            ]
+        self.window_name_regexes = tuple(dict.fromkeys(window_regexes))
+        # Backward-compatible attribute used by existing diagnostics.
+        self.window_name_regex = self.window_name_regexes[0]
         self.window_probe = str(config.get("window_probe") or "xdotool")
         self.capture_tool = str(config.get("capture_tool") or "import")
         self.ocr_tool = str(config.get("ocr_tool") or "tesseract")
@@ -57,18 +75,38 @@ class LinuxCapture:
             list(args), text=True, capture_output=True, timeout=timeout, check=False, env=self._environment()
         )
 
-    def find_window(self) -> str | None:
-        result = self._run([self.window_probe, "search", "--name", self.window_name_regex], timeout=8)
-        ids = [line.strip() for line in result.stdout.splitlines() if line.strip().isdigit()]
-        return ids[-1] if ids else None
+    def find_windows(self) -> list[tuple[str, str]]:
+        windows: list[tuple[str, str]] = []
+        seen_ids: set[str] = set()
+        for regex in self.window_name_regexes:
+            result = self._run(
+                [self.window_probe, "search", "--name", regex],
+                timeout=8,
+            )
+            ids = [
+                line.strip()
+                for line in result.stdout.splitlines()
+                if line.strip().isdigit()
+            ]
+            if ids and ids[-1] not in seen_ids:
+                seen_ids.add(ids[-1])
+                windows.append((regex, ids[-1]))
+        return windows
 
-    def capture(self, scroll_up_clicks: int) -> tuple[str, str] | None:
-        window_id = self.find_window()
-        if not window_id:
-            LOG.warning("collection_window_missing regex=%s", self.window_name_regex)
-            return None
+    def find_window(self) -> str | None:
+        windows = self.find_windows()
+        return windows[0][1] if windows else None
+
+    def _capture_window(
+        self,
+        *,
+        window_id: str,
+        window_regex: str,
+        window_index: int,
+        scroll_up_clicks: int,
+    ) -> tuple[str, str] | None:
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
-        screenshot = self.capture_dir / f"receipt-{stamp}.png"
+        screenshot = self.capture_dir / f"receipt-{stamp}-w{window_index}.png"
         self._run([self.window_probe, "windowactivate", "--sync", window_id], timeout=10)
         self._run([
             self.window_probe, "windowsize", "--sync", window_id,
@@ -92,7 +130,11 @@ class LinuxCapture:
         time.sleep(0.5)
         capture = self._run([self.capture_tool, "-window", window_id, str(screenshot)], timeout=15)
         if capture.returncode != 0 or not screenshot.exists():
-            LOG.warning("capture_failed error=%s", capture.stderr[:300])
+            LOG.warning(
+                "capture_failed regex=%s error=%s",
+                window_regex,
+                capture.stderr[:300],
+            )
             return None
         try:
             ocr = self._run([
@@ -100,7 +142,11 @@ class LinuxCapture:
                 "--psm", str(self.ocr_psm),
             ], timeout=30)
             if ocr.returncode != 0:
-                LOG.warning("ocr_failed error=%s", ocr.stderr[:300])
+                LOG.warning(
+                    "ocr_failed regex=%s error=%s",
+                    window_regex,
+                    ocr.stderr[:300],
+                )
                 return None
             return ocr.stdout, window_id
         finally:
@@ -111,6 +157,31 @@ class LinuxCapture:
                     self.window_probe, "click", "--repeat", str(self.scroll_down_clicks),
                     "--delay", "15", "5",
                 ], timeout=15)
+
+    def capture_all(self, scroll_up_clicks: int) -> list[tuple[str, str]]:
+        windows = self.find_windows()
+        if not windows:
+            LOG.warning(
+                "collection_window_missing regexes=%s",
+                ",".join(self.window_name_regexes),
+            )
+            return []
+        captures: list[tuple[str, str]] = []
+        for index, (regex, window_id) in enumerate(windows, start=1):
+            captured = self._capture_window(
+                window_id=window_id,
+                window_regex=regex,
+                window_index=index,
+                scroll_up_clicks=scroll_up_clicks,
+            )
+            if captured:
+                captures.append(captured)
+        return captures
+
+    def capture(self, scroll_up_clicks: int) -> tuple[str, str] | None:
+        """Compatibility helper returning the first configured window."""
+        captures = self.capture_all(scroll_up_clicks)
+        return captures[0] if captures else None
 
 
 def attempt_plan(platform: Mapping[str, Any]) -> list[dict[str, float | int]]:
@@ -187,10 +258,11 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
             )
             if now_mono >= due:
                 attempt_started = time.monotonic()
-                captured = capture.capture(int(row["scroll_up_clicks"]))
+                captured_rows = capture.capture_all(
+                    int(row["scroll_up_clicks"])
+                )
                 reason = "capture_failed"
-                if captured:
-                    text, window_id = captured
+                for text, window_id in captured_rows:
                     active["texts"].append(text)
                     events, reason = parser.parse_all(
                         OCR_CAPTURE_SEPARATOR.join(active["texts"]),
