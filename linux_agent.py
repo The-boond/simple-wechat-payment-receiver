@@ -169,6 +169,8 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
                     "started": now_mono,
                     "not_before": now_mono + trigger_quiet_seconds,
                     "texts": [],
+                    "emitted_keys": set(),
+                    "candidate_count": 0,
                 }
             else:
                 active["wall"] = wall
@@ -184,34 +186,68 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
                 float(active["not_before"]),
             )
             if now_mono >= due:
+                attempt_started = time.monotonic()
                 captured = capture.capture(int(row["scroll_up_clicks"]))
                 reason = "capture_failed"
                 if captured:
                     text, window_id = captured
                     active["texts"].append(text)
-                    event, receipt_key = parser.parse(
+                    events, reason = parser.parse_all(
                         OCR_CAPTURE_SEPARATOR.join(active["texts"]),
                         trigger_time=int(active["wall"]),
                         trigger_signature=str(active["signature"]),
                         source="wechat-linux-wal-ocr",
                     )
-                    if event:
-                        LOG.info("ocr_candidate attempt=%s window=%s amount=%s occurred_at=%s",
-                                 index + 1, window_id, event.amount, event.occurred_at)
-                        runtime.queue(event, receipt_key)
-                        active = None
+                    fresh = [
+                        (event, receipt_key)
+                        for event, receipt_key in events
+                        if receipt_key not in active["emitted_keys"]
+                    ]
+                    if fresh:
+                        LOG.info(
+                            "ocr_batch attempt=%s window=%s candidates=%s elapsed_ms=%s",
+                            index + 1,
+                            window_id,
+                            len(fresh),
+                            int((time.monotonic() - attempt_started) * 1000),
+                        )
+                        queued: list[str] = []
+                        for event, receipt_key in fresh:
+                            active["emitted_keys"].add(receipt_key)
+                            active["candidate_count"] += 1
+                            LOG.info(
+                                "ocr_candidate attempt=%s window=%s amount=%s occurred_at=%s",
+                                index + 1,
+                                window_id,
+                                event.amount,
+                                event.occurred_at,
+                            )
+                            if runtime.queue(event, receipt_key):
+                                queued.append(event.event_id)
+                        # Post newly recognized receipts before requesting the
+                        # next fallback scroll position. Older retries are
+                        # handled only after the active OCR work.
+                        runtime.deliver_ids(queued, time.monotonic())
                     else:
-                        reason = receipt_key
-                        LOG.info("ocr_attempt_miss attempt=%s reason=%s text_sha256=%s", index + 1, reason,
-                                 hashlib.sha256(normalize_ocr_text(text).encode()).hexdigest()[:16])
-                if active:
-                    index += 1
-                    if index >= len(plan):
-                        LOG.error("ocr_attempts_exhausted reason=%s", reason)
-                        active = None
-                    else:
-                        active["index"] = index
+                        LOG.info(
+                            "ocr_attempt_miss attempt=%s reason=%s text_sha256=%s",
+                            index + 1,
+                            reason or "pattern_not_found",
+                            hashlib.sha256(normalize_ocr_text(text).encode()).hexdigest()[:16],
+                        )
+                index += 1
+                if index >= len(plan):
+                    LOG.info(
+                        "ocr_cycle_complete candidates=%s elapsed_ms=%s last_reason=%s",
+                        active["candidate_count"],
+                        int((time.monotonic() - float(active["started"])) * 1000),
+                        reason,
+                    )
+                    active = None
+                else:
+                    active["index"] = index
 
+        now_mono = time.monotonic()
         runtime.deliver_due(now_mono)
         if now_mono - last_heartbeat >= 60:
             LOG.info("heartbeat platform=linux window=%s pending=%s", bool(capture.find_window()), len(runtime.pending))

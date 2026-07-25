@@ -168,7 +168,7 @@ class ReceiptParser:
             stamp = int(datetime(now.year - 1, month, day, hour, minute, tzinfo=self.timezone).timestamp())
         return stamp
 
-    def parse(
+    def parse_all(
         self,
         text: str,
         *,
@@ -176,7 +176,7 @@ class ReceiptParser:
         trigger_signature: str,
         source: str,
         ignore_freshness: bool = False,
-    ) -> tuple[PaymentEvent | None, str]:
+    ) -> tuple[list[tuple[PaymentEvent, str]], str]:
         normalized = normalize_ocr_text(text)
         candidates: list[tuple[int, str]] = []
         for match in self.pattern.finditer(normalized):
@@ -184,7 +184,7 @@ class ReceiptParser:
                 candidates.append((self._timestamp(match, trigger_time), canonical_money(match.group("amount"))))
             except (ValueError, OverflowError):
                 continue
-        if not candidates and OCR_CAPTURE_SEPARATOR in text:
+        if OCR_CAPTURE_SEPARATOR in text:
             header_re = re.compile(
                 r"(?:经营码)?收款到账通知.{0,160}?"
                 r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
@@ -228,29 +228,59 @@ class ReceiptParser:
                 ):
                     candidates.append((occurred_at, amount))
         if not candidates:
-            return None, "pattern_not_found"
-        occurred_at, amount = min(candidates, key=lambda row: abs(trigger_time - row[0]))
-        age = trigger_time - occurred_at
-        if not ignore_freshness and (age > self.max_age or age < -self.max_future):
-            return None, f"stale age_seconds={age} amount={amount}"
-        receipt_key = f"{self.provider}|{self.channel_id}|{amount}|{occurred_at}"
-        identity = "|".join((receipt_key, trigger_signature, self.agent_id))
-        event_id = "evt_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
-        shown = datetime.fromtimestamp(occurred_at, self.timezone).strftime("%m-%d %H:%M:%S")
-        raw_text = normalized[:4000] if self.include_raw_text else f"微信收款到账 ￥{amount}元 时间 {shown}"
-        return PaymentEvent(
-            event_id=event_id,
-            provider=self.provider,
-            channel_id=self.channel_id,
-            amount=amount,
-            occurred_at=occurred_at,
-            external_txn_id=None,
-            trade_no=None,
-            payer=None,
-            raw_text=raw_text,
+            return [], "pattern_not_found"
+
+        unique_candidates = sorted(set(candidates))
+        events: list[tuple[PaymentEvent, str]] = []
+        stale_reasons: list[str] = []
+        for occurred_at, amount in unique_candidates:
+            age = trigger_time - occurred_at
+            if not ignore_freshness and (age > self.max_age or age < -self.max_future):
+                stale_reasons.append(f"stale age_seconds={age} amount={amount}")
+                continue
+            receipt_key = f"{self.provider}|{self.channel_id}|{amount}|{occurred_at}"
+            identity = "|".join((receipt_key, trigger_signature, self.agent_id))
+            event_id = "evt_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+            shown = datetime.fromtimestamp(occurred_at, self.timezone).strftime("%m-%d %H:%M:%S")
+            raw_text = normalized[:4000] if self.include_raw_text else f"微信收款到账 ￥{amount}元 时间 {shown}"
+            events.append((
+                PaymentEvent(
+                    event_id=event_id,
+                    provider=self.provider,
+                    channel_id=self.channel_id,
+                    amount=amount,
+                    occurred_at=occurred_at,
+                    external_txn_id=None,
+                    trade_no=None,
+                    payer=None,
+                    raw_text=raw_text,
+                    source=source,
+                    agent_id=self.agent_id,
+                ),
+                receipt_key,
+            ))
+        return events, stale_reasons[0] if stale_reasons and not events else ""
+
+    def parse(
+        self,
+        text: str,
+        *,
+        trigger_time: int,
+        trigger_signature: str,
+        source: str,
+        ignore_freshness: bool = False,
+    ) -> tuple[PaymentEvent | None, str]:
+        """Return the receipt nearest the trigger for API compatibility."""
+        events, reason = self.parse_all(
+            text,
+            trigger_time=trigger_time,
+            trigger_signature=trigger_signature,
             source=source,
-            agent_id=self.agent_id,
-        ), receipt_key
+            ignore_freshness=ignore_freshness,
+        )
+        if not events:
+            return None, reason
+        return min(events, key=lambda row: abs(trigger_time - row[0].occurred_at))
 
 
 class EventSpool:
@@ -286,6 +316,18 @@ class EventSpool:
         source = self.pending / f"{event.event_id}.json"
         if source.exists():
             os.replace(source, self.processed / source.name)
+
+    def reject(self, event: PaymentEvent, reason: str) -> None:
+        source = self.pending / f"{event.event_id}.json"
+        if source.exists():
+            os.replace(source, self.rejected / source.name)
+        reason_path = self.rejected / f"{event.event_id}.reason.txt"
+        temporary = reason_path.with_suffix(".tmp")
+        temporary.write_text(
+            f"{int(time.time())} {reason.strip()[:500]}\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, reason_path)
 
 
 class ReceiptDedupe:
@@ -363,36 +405,78 @@ class AgentRuntime:
         self.spool = EventSpool(resolve_path(str(runtime.get("spool_dir") or "spool"), config))
         self.dedupe = ReceiptDedupe(resolve_path(str(runtime.get("dedupe_file") or "spool/receipt-dedupe.json"), config))
         self.client = BridgeClient(config)
-        self.pending: dict[str, tuple[PaymentEvent, float, int]] = {
-            event.event_id: (event, 0.0, 0) for event in self.spool.load()
+        self.pending: dict[str, tuple[PaymentEvent, float, int, str | None]] = {
+            event.event_id: (event, 0.0, 0, None) for event in self.spool.load()
         }
         self.max_retry_seconds = float(runtime.get("max_retry_seconds", 300))
+        self.no_candidate_max_age_seconds = max(
+            300, int(runtime.get("no_candidate_max_age_seconds", 2100))
+        )
+        self.retry_max_age_seconds = max(
+            self.no_candidate_max_age_seconds,
+            int(runtime.get("retry_max_age_seconds", 86400)),
+        )
 
     def queue(self, event: PaymentEvent, receipt_key: str) -> bool:
         if self.dedupe.contains(receipt_key):
             LOG.info("receipt_duplicate key=%s", receipt_key)
             return False
         self.spool.put(event)
-        self.pending[event.event_id] = (event, 0.0, 0)
+        self.pending[event.event_id] = (event, 0.0, 0, None)
         self.dedupe.add(receipt_key)
         return True
 
-    def deliver_due(self, now_mono: float) -> None:
+    def _deliver_one(self, event_id: str, now_mono: float) -> None:
         permanent = {"channel_disabled", "channel_provider_mismatch", "invalid_event"}
-        for event_id, (event, next_attempt, attempts) in list(self.pending.items()):
-            if now_mono < next_attempt:
-                continue
-            result = self.client.send(event)
-            LOG.info("event=%s agent_id=%s amount=%s result=%s", event_id, event.agent_id, event.amount,
-                     json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-            if result.get("ok") is True or result.get("reason") in permanent:
-                self.spool.acknowledge(event)
-                del self.pending[event_id]
-                continue
-            attempts += 1
-            delay = min(self.max_retry_seconds, float(2 ** min(attempts, 8)))
-            self.pending[event_id] = (event, now_mono + delay, attempts)
-            LOG.warning("event_retry event=%s attempts=%s delay=%s", event_id, attempts, int(delay))
+        item = self.pending.get(event_id)
+        if item is None:
+            return
+        event, next_attempt, attempts, last_reason = item
+        if now_mono < next_attempt:
+            return
+        age = max(0, int(time.time()) - int(event.occurred_at))
+        expired_reason = ""
+        if age > self.retry_max_age_seconds:
+            expired_reason = f"retry_expired age_seconds={age}"
+        elif last_reason == "no_candidate" and age > self.no_candidate_max_age_seconds:
+            expired_reason = f"no_candidate_expired age_seconds={age}"
+        if expired_reason:
+            self.spool.reject(event, expired_reason)
+            del self.pending[event_id]
+            LOG.warning("event_archived event=%s reason=%s", event_id, expired_reason)
+            return
+
+        result = self.client.send(event)
+        LOG.info("event=%s agent_id=%s amount=%s result=%s", event_id, event.agent_id, event.amount,
+                 json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        if result.get("ok") is True:
+            self.spool.acknowledge(event)
+            del self.pending[event_id]
+            return
+        reason = str(result.get("reason") or result.get("result") or "unknown")
+        if reason in permanent:
+            self.spool.reject(event, reason)
+            del self.pending[event_id]
+            LOG.error("event_rejected event=%s reason=%s", event_id, reason)
+            return
+        attempts += 1
+        delay = min(self.max_retry_seconds, float(2 ** min(attempts, 8)))
+        self.pending[event_id] = (event, now_mono + delay, attempts, reason)
+        LOG.warning(
+            "event_retry event=%s attempts=%s delay=%s reason=%s",
+            event_id,
+            attempts,
+            int(delay),
+            reason,
+        )
+
+    def deliver_ids(self, event_ids: Iterable[str], now_mono: float) -> None:
+        for event_id in event_ids:
+            self._deliver_one(event_id, now_mono)
+
+    def deliver_due(self, now_mono: float) -> None:
+        for event_id in list(self.pending):
+            self._deliver_one(event_id, now_mono)
 
 
 def file_signature(path: Path) -> tuple[int, int] | None:

@@ -17,8 +17,10 @@
 - Linux：业务消息 WAL 触发 + X11 截图 + Tesseract OCR。
 - 启动只建立基线，不重放历史收款记录。
 - 明确金额、月日和时分必须接近 WAL 触发时间。
-- 多次 OCR 尝试与可配置窗口位置，适应不同微信界面布局。
+- 第一轮 OCR 识别后立即上报，后续滚动位置继续补扫。
+- 单次 OCR 周期可提取多张到账卡片，适应短时间连续付款。
 - HMAC-SHA256 签名、事件 ID、持久 spool、指数退避和幂等重试。
+- 过期 `no_candidate` 自动进入 rejected 归档，不会无限占用重试队列。
 - 默认不保存完整 OCR 文本或截图。
 - 附带一个最小 HMAC Webhook 接收示例。
 
@@ -107,6 +109,8 @@ cp configs/linux.example.json config.json
 - `parser.max_event_age_seconds`
 - `runtime.poll_seconds`
 - `runtime.spool_dir`
+- `runtime.no_candidate_max_age_seconds`：无候选事件的最长保留时间，默认 2100 秒
+- `runtime.retry_max_age_seconds`：传输失败事件的最长保留时间，默认 86400 秒
 - `trigger_quiet_seconds`：WAL 最后一次变化后的静默等待，避免文件仍在写入时过早 OCR
 - `capture_attempts` 的延迟和滚动位置
 - OCR 命令、语言、PSM、截图保留策略
@@ -152,6 +156,14 @@ python3 linux_agent.py --config config.json
 
 `deploy/linux/` 提供 systemd 和环境文件示例。替换 `YOUR_USER`、路径和 DISPLAY 后安装；环境文件权限建议为 `0600`。
 
+### 连续多笔付款
+
+每次截图后，Agent 会解析当前累计 OCR 文本中的全部新到账卡片。识别出的事件会先写入持久 spool，并在下一张补扫截图前立即发送；相邻滚动位置重复出现的同一张卡片会被去重。
+
+微信收款助手通常只显示到分钟。接收端如果可能同时存在多笔同价订单，应给收银台金额分配不同的分币尾数，并要求付款人严格支付页面显示的完整金额。例如同为 `¥100.00` 的订单可依次显示为 `¥100.00`、`¥100.01`、`¥100.02`。尾数分配必须使用数据库事务或唯一约束。
+
+失败事件不会覆盖新到账识别。`no_candidate` 达到配置的保留时间后会从 pending 移入 rejected，并生成对应的 `.reason.txt`；网络故障等其他失败按 `retry_max_age_seconds` 保留。
+
 ## 本地接收测试
 
 终端 1：
@@ -181,7 +193,7 @@ python3 examples/webhook_receiver.py
 2. 以 `event_id` 建立唯一索引。
 3. 校验 provider、channel、金额范围和事件时间。
 4. 只匹配时间窗口内唯一的待支付订单。
-5. 同金额存在多笔订单时保留待确认状态。
+5. 同价并发订单分配唯一分币尾数；仍然同金额时保留待确认状态。
 6. 完成订单、发货或开通服务必须使用数据库事务和幂等保护。
 
 ## 测试

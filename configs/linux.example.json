@@ -16,7 +16,9 @@
     "poll_seconds": 0.5,
     "spool_dir": "../spool/linux",
     "dedupe_file": "../spool/linux/receipt-dedupe.json",
-    "max_retry_seconds": 300
+    "max_retry_seconds": 300,
+    "no_candidate_max_age_seconds": 2100,
+    "retry_max_age_seconds": 86400
   },
   "parser": {
     "timezone": "Asia/Shanghai",

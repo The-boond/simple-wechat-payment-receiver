@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from receiver_core import (
+    AgentRuntime,
     EventSpool,
     OCR_CAPTURE_SEPARATOR,
     PaymentEvent,
@@ -96,6 +98,31 @@ class ReceiptParserTests(unittest.TestCase):
         assert one and two
         self.assertNotEqual(one.event_id, two.event_id)
 
+    def test_parse_all_returns_multiple_receipts_from_one_minute(self) -> None:
+        text = (
+            "经营码收款到账通知 07月21日22:33 收款金额 ¥18.88 "
+            "经营码收款到账通知 07月21日22:33 收款金额 ¥18.89"
+        )
+        events, reason = self.parser.parse_all(
+            text,
+            trigger_time=self.trigger,
+            trigger_signature="batch",
+            source="test",
+        )
+        self.assertEqual("", reason)
+        self.assertEqual(["18.88", "18.89"], [event.amount for event, _ in events])
+        self.assertEqual(2, len({key for _, key in events}))
+
+    def test_parse_all_collapses_duplicates_across_captures(self) -> None:
+        text = OCR_CAPTURE_SEPARATOR.join([self.text, self.text])
+        events, _ = self.parser.parse_all(
+            text,
+            trigger_time=self.trigger,
+            trigger_signature="batch",
+            source="test",
+        )
+        self.assertEqual(1, len(events))
+
 
 class ConfigTests(unittest.TestCase):
     def test_requires_https_for_remote_hosts(self) -> None:
@@ -153,6 +180,49 @@ class StorageTests(unittest.TestCase):
             first.add("receipt")
             second = ReceiptDedupe(path)
             self.assertTrue(second.contains("receipt"))
+
+    def test_reject_keeps_event_and_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            spool = EventSpool(Path(directory))
+            spool.put(self.event())
+            spool.reject(self.event(), "no_candidate_expired")
+            self.assertFalse((spool.pending / f"{self.event().event_id}.json").exists())
+            self.assertTrue((spool.rejected / f"{self.event().event_id}.json").exists())
+            reason = (
+                spool.rejected / f"{self.event().event_id}.reason.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("no_candidate_expired", reason)
+
+    def test_runtime_archives_expired_no_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = base_config()
+            config["_config_dir"] = directory
+            config["runtime"] = {
+                "spool_dir": "spool",
+                "dedupe_file": "dedupe.json",
+                "no_candidate_max_age_seconds": 300,
+                "retry_max_age_seconds": 86400,
+            }
+            old_event = PaymentEvent(
+                **{
+                    **self.event().payload(),
+                    "occurred_at": int(time.time()) - 301,
+                }
+            )
+            with patch.dict(os.environ, {"TEST_RECEIVER_TOKEN": "secret"}, clear=False):
+                runtime = AgentRuntime(config)
+            runtime.queue(old_event, "old-receipt")
+            runtime.pending[old_event.event_id] = (
+                old_event,
+                0.0,
+                1,
+                "no_candidate",
+            )
+            runtime.deliver_due(time.monotonic())
+            self.assertEqual({}, runtime.pending)
+            self.assertTrue(
+                (runtime.spool.rejected / f"{old_event.event_id}.json").exists()
+            )
 
     def test_trigger_glob(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

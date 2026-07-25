@@ -1,6 +1,6 @@
 [project]
 name = "simple-wechat-payment-receiver"
-version = "1.0.0"
+version = "1.1.0"
 description = "Configurable Linux WeChat desktop payment notification receiver"
 readme = "README.md"
 requires-python = ">=3.10"
