@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any, Mapping, Sequence
 from receiver_core import (
     AgentRuntime,
     OCR_CAPTURE_SEPARATOR,
+    OCR_LATEST_CLOCK_PREFIX,
     ReceiptParser,
     discover_trigger_files,
     file_signature,
@@ -74,6 +76,75 @@ class LinuxCapture:
         return subprocess.run(
             list(args), text=True, capture_output=True, timeout=timeout, check=False, env=self._environment()
         )
+
+    def _latest_clock_probe(self, screenshot: Path) -> str | None:
+        """Recover the newest pale HH:MM clock from the chat center strip."""
+        strip = screenshot.with_name(screenshot.stem + "-clock-strip.png")
+        crop_width = max(180, min(320, int(self.window_width * 0.31)))
+        crop_x = max(0, (self.window_width - crop_width) // 2)
+        started = time.monotonic()
+        try:
+            enhanced = self._run(
+                [
+                    "convert",
+                    str(screenshot),
+                    "-crop",
+                    f"{crop_width}x{self.window_height}+{crop_x}+0",
+                    "+repage",
+                    "-resize",
+                    "300%",
+                    "-colorspace",
+                    "Gray",
+                    "-threshold",
+                    "82%",
+                    str(strip),
+                ],
+                timeout=15,
+            )
+            if enhanced.returncode != 0 or not strip.exists():
+                LOG.debug(
+                    "wechat_clock_probe_convert_failed error=%s",
+                    enhanced.stderr[:300],
+                )
+                return None
+            clock_ocr = self._run(
+                [
+                    self.ocr_tool,
+                    str(strip),
+                    "stdout",
+                    "-l",
+                    "eng",
+                    "--psm",
+                    "11",
+                ],
+                timeout=15,
+            )
+            if clock_ocr.returncode != 0:
+                LOG.debug(
+                    "wechat_clock_probe_ocr_failed error=%s",
+                    clock_ocr.stderr[:300],
+                )
+                return None
+            clocks: list[str] = []
+            for hour_text, minute_text in re.findall(
+                r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)",
+                clock_ocr.stdout,
+            ):
+                hour = int(hour_text)
+                minute = int(minute_text)
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    clocks.append(f"{hour:02d}:{minute:02d}")
+            if not clocks:
+                return None
+            latest = clocks[-1]
+            LOG.info(
+                "wechat_clock_probe clock=%s elapsed_ms=%s",
+                latest,
+                int((time.monotonic() - started) * 1000),
+            )
+            return latest
+        finally:
+            strip.unlink(missing_ok=True)
 
     def find_windows(self) -> list[tuple[str, str]]:
         windows: list[tuple[str, str]] = []
@@ -148,7 +219,17 @@ class LinuxCapture:
                     ocr.stderr[:300],
                 )
                 return None
-            return ocr.stdout, window_id
+            ocr_text = ocr.stdout
+            if "微信支付商家助手" in window_regex:
+                latest_clock = self._latest_clock_probe(screenshot)
+                if latest_clock:
+                    ocr_text += (
+                        "\n"
+                        + OCR_LATEST_CLOCK_PREFIX
+                        + latest_clock
+                        + "\n"
+                    )
+            return ocr_text, window_id
         finally:
             if not self.keep_screenshots:
                 screenshot.unlink(missing_ok=True)

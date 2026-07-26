@@ -14,6 +14,7 @@ from receiver_core import (
     AgentRuntime,
     EventSpool,
     OCR_CAPTURE_SEPARATOR,
+    OCR_LATEST_CLOCK_PREFIX,
     PaymentEvent,
     ReceiptDedupe,
     ReceiptParser,
@@ -169,6 +170,31 @@ class ReceiptParserTests(unittest.TestCase):
         self.assertIsNotNone(event)
         assert event is not None
         self.assertEqual(1785006840, event.occurred_at)
+
+    def test_merchant_receipt_uses_enhanced_latest_clock_fallback(self) -> None:
+        trigger = int(
+            datetime(
+                2026,
+                7,
+                26,
+                9,
+                43,
+                50,
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            ).timestamp()
+        )
+        events, reason = self.parser.parse_all(
+            "收款通知 收款金额：¥19.07 商品名称：店铺 "
+            "收款通知 收款金额：¥35.15 商品名称：店铺 "
+            + OCR_LATEST_CLOCK_PREFIX
+            + "09:43",
+            trigger_time=trigger,
+            trigger_signature="merchant-clock-probe",
+            source="test",
+        )
+        self.assertEqual("", reason)
+        self.assertEqual(["35.15"], [event.amount for event, _ in events])
+        self.assertEqual(1785030180, events[0][0].occurred_at)
 
     def test_merchant_clock_does_not_cross_capture_boundary(self) -> None:
         trigger = int(

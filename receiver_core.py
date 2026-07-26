@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 LOG = logging.getLogger("wechat-payment-receiver")
 OCR_CAPTURE_SEPARATOR = "\n<<<WECHAT_CAPTURE_BREAK>>>\n"
+OCR_LATEST_CLOCK_PREFIX = "WECHAT_LATEST_CLOCK="
 
 
 DEFAULT_RECEIPT_PATTERN = (
@@ -218,20 +219,40 @@ class ReceiptParser:
         # is never joined to a receipt card in the next screenshot.
         for segment in text.split(OCR_CAPTURE_SEPARATOR):
             normalized_segment = normalize_ocr_text(segment)
-            for receipt in merchant_receipt_re.finditer(normalized_segment):
+            merchant_matches = list(
+                merchant_receipt_re.finditer(normalized_segment)
+            )
+            latest_clock_match = re.search(
+                rf"{re.escape(OCR_LATEST_CLOCK_PREFIX)}"
+                r"(?P<hour>\d{1,2}):(?P<minute>\d{2})",
+                normalized_segment,
+            )
+            for match_index, receipt in enumerate(merchant_matches):
                 prefix = normalized_segment[
                     max(0, receipt.start() - 320) : receipt.start()
                 ]
                 clocks = list(merchant_clock_re.finditer(prefix))
-                if not clocks:
+                if clocks:
+                    hour = int(clocks[-1].group("hour"))
+                    minute = int(clocks[-1].group("minute"))
+                elif (
+                    latest_clock_match
+                    and match_index == len(merchant_matches) - 1
+                ):
+                    # The pale chat clock can disappear from full-window OCR.
+                    # A contrast-enhanced center-strip probe supplies the
+                    # newest visible clock. Bind it only to the newest receipt
+                    # so older cards are never replayed as new.
+                    hour = int(latest_clock_match.group("hour"))
+                    minute = int(latest_clock_match.group("minute"))
+                else:
                     continue
-                clock = clocks[-1]
                 try:
                     candidates.append(
                         (
                             self._clock_timestamp(
-                                int(clock.group("hour")),
-                                int(clock.group("minute")),
+                                hour,
+                                minute,
                                 trigger_time,
                             ),
                             canonical_money(receipt.group("amount")),
