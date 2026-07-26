@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from receiver_core import (
     AgentRuntime,
@@ -22,6 +23,8 @@ from receiver_core import (
     OCR_CAPTURE_SEPARATOR,
     PaymentEvent,
     ReceiptParser,
+    ServiceNotificationReceipt,
+    ServiceNotificationState,
     VisualAmount,
     VisualClock,
     VisualToken,
@@ -34,6 +37,7 @@ from receiver_core import (
     normalize_ocr_text,
     parse_tesseract_tsv,
     resolve_path,
+    service_notification_receipts,
     setup_logging,
     trigger_file_change,
     validate_config,
@@ -60,6 +64,18 @@ class OcrFrameResult:
     text: str | None
     elapsed_ms: int
     error: str | None
+
+
+@dataclass(frozen=True)
+class ServiceNotificationScanResult:
+    """Outcome of one overlap scan of the Service Notifications chat."""
+
+    available: bool
+    successful: bool
+    receipts: tuple[ServiceNotificationReceipt, ...]
+    frames: int
+    anchor_found: bool
+    coverage_reason: str
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -239,6 +255,69 @@ class LinuxCapture:
             1,
             int(config.get("screenshot_max_files", 2000)),
         )
+        service = config.get("service_notifications", {})
+        if not isinstance(service, Mapping):
+            service = {}
+        self.service_notifications_enabled = _as_bool(
+            service.get("enabled"),
+            default=False,
+        )
+        self.service_window_regex = str(
+            service.get("window_name_regex") or "^Weixin$"
+        ).strip()
+        self.service_overlay_regex = str(
+            service.get("close_overlay_name_regex") or "^微信收款商业版$"
+        ).strip()
+        self.service_window_width = max(
+            760,
+            int(service.get("window_width", 1020)),
+        )
+        self.service_window_height = max(
+            700,
+            int(service.get("window_height", 860)),
+        )
+        self.service_window_x = max(0, int(service.get("window_x", 420)))
+        self.service_window_y = max(0, int(service.get("window_y", 20)))
+        self.service_pointer_x = max(0, int(service.get("pointer_x", 760)))
+        self.service_pointer_y = max(0, int(service.get("pointer_y", 430)))
+        self.service_ocr_crop_x = max(0, int(service.get("ocr_crop_x", 400)))
+        self.service_ocr_crop_y = max(0, int(service.get("ocr_crop_y", 40)))
+        self.service_ocr_crop_width = max(
+            320,
+            int(service.get("ocr_crop_width", 580)),
+        )
+        self.service_ocr_crop_height = max(
+            480,
+            int(service.get("ocr_crop_height", 810)),
+        )
+        self.service_scroll_up_clicks = max(
+            1,
+            int(service.get("scroll_up_clicks", 6)),
+        )
+        self.service_scroll_down_clicks = max(
+            30,
+            int(service.get("scroll_down_clicks", 100)),
+        )
+        self.service_scan_batch_frames = max(
+            1,
+            min(8, int(service.get("scan_batch_frames", 4))),
+        )
+        self.service_baseline_frames = max(
+            2,
+            min(32, int(service.get("baseline_frames", 8))),
+        )
+        self.service_scan_max_frames = max(
+            self.service_baseline_frames,
+            min(256, int(service.get("scan_max_frames", 160))),
+        )
+        self.service_settle_seconds = max(
+            0.1,
+            float(service.get("settle_seconds", 0.30)),
+        )
+        self.service_tail_recheck_seconds = max(
+            0.1,
+            float(service.get("tail_recheck_seconds", 0.45)),
+        )
 
         self.last_capture_successful = False
         self.last_capture_frames = 0
@@ -258,22 +337,26 @@ class LinuxCapture:
     ) -> subprocess.CompletedProcess[str]:
         return command(args, timeout=timeout, env=self._environment())
 
+    def _find_window(self, regex: str) -> str | None:
+        result = self._run(
+            [self.window_probe, "search", "--name", regex],
+            timeout=8,
+        )
+        ids = [
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip().isdigit()
+        ]
+        return ids[-1] if ids else None
+
     def find_windows(self) -> list[tuple[str, str]]:
         windows: list[tuple[str, str]] = []
         seen_ids: set[str] = set()
         for regex in self.window_name_regexes:
-            result = self._run(
-                [self.window_probe, "search", "--name", regex],
-                timeout=8,
-            )
-            ids = [
-                line.strip()
-                for line in result.stdout.splitlines()
-                if line.strip().isdigit()
-            ]
-            if ids and ids[-1] not in seen_ids:
-                seen_ids.add(ids[-1])
-                windows.append((regex, ids[-1]))
+            window_id = self._find_window(regex)
+            if window_id and window_id not in seen_ids:
+                seen_ids.add(window_id)
+                windows.append((regex, window_id))
         return windows
 
     def find_window(self) -> str | None:
@@ -290,6 +373,505 @@ class LinuxCapture:
             result.stderr[:500],
         )
         return False
+
+    def _window_geometry(self, window_id: str) -> dict[str, int] | None:
+        result = self._run(
+            [
+                self.window_probe,
+                "getwindowgeometry",
+                "--shell",
+                window_id,
+            ],
+            timeout=8,
+        )
+        if result.returncode != 0:
+            return None
+        values: dict[str, int] = {}
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in {"X", "Y", "WIDTH", "HEIGHT"}:
+                try:
+                    values[key] = int(value)
+                except ValueError:
+                    return None
+        return values if len(values) == 4 else None
+
+    def _capture_service_window(
+        self,
+        screenshot: Path,
+    ) -> tuple[bool, str | None]:
+        """Capture the compositor root, then crop the positioned Weixin window."""
+
+        root = screenshot.with_name("." + screenshot.stem + "-root.png")
+        try:
+            captured = self._run(
+                [self.capture_tool, "-window", "root", str(root)],
+                timeout=self.capture_timeout,
+            )
+            if captured.returncode != 0 or not root.exists():
+                return False, captured.stderr[:500]
+            cropped = self._run(
+                [
+                    self.convert_tool,
+                    str(root),
+                    "-crop",
+                    (
+                        f"{self.service_window_width}x{self.service_window_height}"
+                        f"+{self.service_window_x}+{self.service_window_y}"
+                    ),
+                    "+repage",
+                    str(screenshot),
+                ],
+                timeout=max(self.capture_timeout, 20),
+            )
+            if cropped.returncode != 0 or not screenshot.exists():
+                return False, cropped.stderr[:500]
+            return True, None
+        finally:
+            root.unlink(missing_ok=True)
+
+    def _service_visual_fingerprint_file(
+        self,
+        screenshot: Path,
+    ) -> str | None:
+        result = self._run_binary(
+            [
+                self.convert_tool,
+                str(screenshot),
+                "-crop",
+                (
+                    f"{self.service_ocr_crop_width}x"
+                    f"{self.service_ocr_crop_height}"
+                    f"+{self.service_ocr_crop_x}+{self.service_ocr_crop_y}"
+                ),
+                "+repage",
+                "-resize",
+                "64x64!",
+                "-colorspace",
+                "Gray",
+                "-depth",
+                "8",
+                "gray:-",
+            ],
+            timeout=self.probe_timeout,
+        )
+        if result is None or result.returncode != 0 or not result.stdout:
+            return None
+        return hashlib.sha256(result.stdout).hexdigest()
+
+    def _ocr_service_frame(
+        self,
+        screenshot: Path,
+    ) -> tuple[Path, str | None, int, str | None]:
+        """OCR only the detailed receipt-card pane of an immutable screenshot."""
+
+        enhanced = screenshot.with_name(
+            screenshot.stem + "-service-ocr.png"
+        )
+        started = time.monotonic()
+        try:
+            prepared = self._run(
+                [
+                    self.convert_tool,
+                    str(screenshot),
+                    "-crop",
+                    (
+                        f"{self.service_ocr_crop_width}x"
+                        f"{self.service_ocr_crop_height}"
+                        f"+{self.service_ocr_crop_x}+{self.service_ocr_crop_y}"
+                    ),
+                    "+repage",
+                    "-resize",
+                    "150%",
+                    str(enhanced),
+                ],
+                timeout=max(self.capture_timeout, 20),
+            )
+            if prepared.returncode != 0 or not enhanced.exists():
+                return (
+                    screenshot,
+                    None,
+                    int((time.monotonic() - started) * 1000),
+                    prepared.stderr[:500],
+                )
+            result = self._run(
+                [
+                    self.ocr_tool,
+                    str(enhanced),
+                    "stdout",
+                    "-l",
+                    self.ocr_language,
+                    "--psm",
+                    str(self.ocr_psm),
+                ],
+                timeout=self.ocr_timeout,
+            )
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if result.returncode != 0:
+                return screenshot, None, elapsed_ms, result.stderr[:500]
+            return screenshot, result.stdout, elapsed_ms, None
+        finally:
+            enhanced.unlink(missing_ok=True)
+
+    def capture_service_notifications(
+        self,
+        *,
+        state: ServiceNotificationState,
+        trigger_time: int,
+        timezone: ZoneInfo,
+        baseline_only: bool,
+    ) -> ServiceNotificationScanResult:
+        """Scan overlapping cards until a persistent transaction anchor."""
+
+        if not self.service_notifications_enabled:
+            return ServiceNotificationScanResult(
+                available=False,
+                successful=False,
+                receipts=(),
+                frames=0,
+                anchor_found=False,
+                coverage_reason="disabled",
+            )
+        window_id = self._find_window(self.service_window_regex)
+        if not window_id:
+            LOG.warning(
+                "wechat_service_window_missing regex=%s",
+                self.service_window_regex,
+            )
+            return ServiceNotificationScanResult(
+                available=False,
+                successful=False,
+                receipts=(),
+                frames=0,
+                anchor_found=False,
+                coverage_reason="window_missing",
+            )
+
+        geometry = self._window_geometry(window_id)
+        receipts: dict[str, ServiceNotificationReceipt] = {}
+        seen_fingerprints: set[str] = set()
+        known_ids = set(state.transaction_ids)
+        captured_paths: list[Path] = []
+        first_bottom_fingerprint: str | None = None
+        frames = 0
+        scrolled_clicks = 0
+        anchor_found = False
+        repeated_frame = False
+        capture_error = False
+        ocr_error = False
+        bottom_restored = False
+        coverage_reason = "incomplete"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+
+        overlay_id = (
+            self._find_window(self.service_overlay_regex)
+            if self.service_overlay_regex
+            else None
+        )
+        if overlay_id and overlay_id != window_id:
+            self._xdotool("windowclose", overlay_id)
+            time.sleep(0.2)
+
+        prepared = all(
+            (
+                self._xdotool("windowactivate", "--sync", window_id),
+                self._xdotool(
+                    "windowsize",
+                    "--sync",
+                    window_id,
+                    str(self.service_window_width),
+                    str(self.service_window_height),
+                ),
+                self._xdotool(
+                    "windowmove",
+                    "--sync",
+                    window_id,
+                    str(self.service_window_x),
+                    str(self.service_window_y),
+                ),
+                self._xdotool(
+                    "mousemove",
+                    "--window",
+                    window_id,
+                    str(self.service_pointer_x),
+                    str(self.service_pointer_y),
+                ),
+            )
+        )
+        if not prepared:
+            capture_error = True
+
+        try:
+            # Pointer-directed wheel scrolling avoids clicking the receipt card.
+            self._xdotool("key", "--window", window_id, "End")
+            if not self._xdotool(
+                "click",
+                "--repeat",
+                str(self.service_scroll_down_clicks),
+                "--delay",
+                "20",
+                "5",
+            ):
+                capture_error = True
+            time.sleep(self.service_settle_seconds)
+
+            stop_scan = False
+            while not stop_scan and frames < self.service_scan_max_frames:
+                batch: list[Path] = []
+                for _ in range(self.service_scan_batch_frames):
+                    if frames > 0:
+                        if not self._xdotool(
+                            "click",
+                            "--repeat",
+                            str(self.service_scroll_up_clicks),
+                            "--delay",
+                            "70",
+                            "4",
+                        ):
+                            capture_error = True
+                            stop_scan = True
+                            break
+                        scrolled_clicks += self.service_scroll_up_clicks
+                        time.sleep(self.service_settle_seconds)
+
+                    screenshot = self.capture_dir / (
+                        f"receipt-service-{stamp}-a{frames + 1}"
+                        f"-up{scrolled_clicks}.png"
+                    )
+                    captured, error = self._capture_service_window(screenshot)
+                    if not captured:
+                        capture_error = True
+                        stop_scan = True
+                        LOG.warning(
+                            "wechat_service_capture_failed attempt=%s error=%s",
+                            frames + 1,
+                            error,
+                        )
+                        break
+
+                    fingerprint = self._service_visual_fingerprint_file(
+                        screenshot
+                    )
+                    if frames == 0:
+                        first_bottom_fingerprint = fingerprint
+                    if fingerprint and fingerprint in seen_fingerprints:
+                        screenshot.unlink(missing_ok=True)
+                        repeated_frame = True
+                        coverage_reason = "repeated_frame"
+                        stop_scan = True
+                        break
+                    if fingerprint:
+                        seen_fingerprints.add(fingerprint)
+                    frames += 1
+                    batch.append(screenshot)
+                    captured_paths.append(screenshot)
+                    LOG.info(
+                        "wechat_service_capture attempt=%s scroll_up=%s "
+                        "screenshot=%s",
+                        frames,
+                        scrolled_clicks,
+                        screenshot,
+                    )
+                    if baseline_only and frames >= self.service_baseline_frames:
+                        stop_scan = True
+                        coverage_reason = "baseline_recent_frames"
+                        break
+                    if frames >= self.service_scan_max_frames:
+                        stop_scan = True
+                        coverage_reason = "safety_fuse"
+                        break
+
+                if batch:
+                    with ThreadPoolExecutor(
+                        max_workers=self.ocr_workers,
+                        thread_name_prefix="wechat-service-ocr",
+                    ) as executor:
+                        results = list(
+                            executor.map(self._ocr_service_frame, batch)
+                        )
+                    for screenshot, text, elapsed_ms, error in results:
+                        if error is not None or text is None:
+                            ocr_error = True
+                            LOG.warning(
+                                "wechat_service_ocr_failed screenshot=%s "
+                                "error=%s",
+                                screenshot,
+                                error,
+                            )
+                            continue
+                        parsed = service_notification_receipts(
+                            text,
+                            trigger_time=trigger_time,
+                            timezone=timezone,
+                        )
+                        for receipt in parsed:
+                            receipts.setdefault(
+                                receipt.external_txn_id,
+                                receipt,
+                            )
+                        LOG.info(
+                            "wechat_service_ocr screenshot=%s elapsed_ms=%s "
+                            "receipts=%s",
+                            screenshot,
+                            elapsed_ms,
+                            len(parsed),
+                        )
+
+                if state.initialized and any(
+                    transaction_id in known_ids for transaction_id in receipts
+                ):
+                    anchor_found = True
+                    coverage_reason = "known_transaction_anchor"
+                    stop_scan = True
+                elif repeated_frame:
+                    stop_scan = True
+
+            if not baseline_only and not anchor_found and not repeated_frame:
+                if frames >= self.service_scan_max_frames:
+                    coverage_reason = "safety_fuse"
+                elif coverage_reason == "incomplete":
+                    coverage_reason = "anchor_not_found"
+        finally:
+            self._xdotool(
+                "mousemove",
+                "--window",
+                window_id,
+                str(self.service_pointer_x),
+                str(self.service_pointer_y),
+            )
+            self._xdotool("key", "--window", window_id, "End")
+            restore_clicks = max(
+                self.service_scroll_down_clicks,
+                scrolled_clicks + self.service_scroll_up_clicks * 3,
+            )
+            bottom_restored = self._xdotool(
+                "click",
+                "--repeat",
+                str(restore_clicks),
+                "--delay",
+                "20",
+                "5",
+            )
+            if bottom_restored:
+                time.sleep(self.service_tail_recheck_seconds)
+                tail = self.capture_dir / (
+                    f"receipt-service-{stamp}-tail-up0.png"
+                )
+                captured, error = self._capture_service_window(tail)
+                if not captured:
+                    capture_error = True
+                    LOG.warning(
+                        "wechat_service_tail_capture_failed error=%s",
+                        error,
+                    )
+                else:
+                    tail_fingerprint = self._service_visual_fingerprint_file(
+                        tail
+                    )
+                    if (
+                        first_bottom_fingerprint
+                        and tail_fingerprint == first_bottom_fingerprint
+                    ):
+                        tail.unlink(missing_ok=True)
+                    else:
+                        captured_paths.append(tail)
+                        (
+                            _screenshot,
+                            tail_text,
+                            elapsed_ms,
+                            tail_error,
+                        ) = self._ocr_service_frame(tail)
+                        if tail_error is not None or tail_text is None:
+                            ocr_error = True
+                            LOG.warning(
+                                "wechat_service_tail_ocr_failed error=%s",
+                                tail_error,
+                            )
+                        else:
+                            frames += 1
+                            parsed = service_notification_receipts(
+                                tail_text,
+                                trigger_time=trigger_time,
+                                timezone=timezone,
+                            )
+                            for receipt in parsed:
+                                receipts.setdefault(
+                                    receipt.external_txn_id,
+                                    receipt,
+                                )
+                            LOG.info(
+                                "wechat_service_tail_ocr elapsed_ms=%s "
+                                "receipts=%s",
+                                elapsed_ms,
+                                len(parsed),
+                            )
+            else:
+                capture_error = True
+
+            if geometry is not None:
+                restored_geometry = all(
+                    (
+                        self._xdotool(
+                            "windowsize",
+                            "--sync",
+                            window_id,
+                            str(geometry["WIDTH"]),
+                            str(geometry["HEIGHT"]),
+                        ),
+                        self._xdotool(
+                            "windowmove",
+                            "--sync",
+                            window_id,
+                            str(geometry["X"]),
+                            str(geometry["Y"]),
+                        ),
+                    )
+                )
+                if not restored_geometry:
+                    capture_error = True
+            if not self.keep_screenshots:
+                for screenshot in captured_paths:
+                    screenshot.unlink(missing_ok=True)
+
+        ordered_receipts = tuple(
+            sorted(
+                receipts.values(),
+                key=lambda item: (item.occurred_at, item.external_txn_id),
+                reverse=True,
+            )
+        )
+        coverage_complete = (
+            (baseline_only and coverage_reason == "baseline_recent_frames")
+            or anchor_found
+            or repeated_frame
+        )
+        if baseline_only and not ordered_receipts:
+            coverage_complete = False
+            coverage_reason = "baseline_no_complete_receipt"
+        successful = bool(
+            frames > 0
+            and coverage_complete
+            and bottom_restored
+            and not capture_error
+            and not ocr_error
+        )
+        LOG.info(
+            "wechat_service_scan_complete success=%s frames=%s receipts=%s "
+            "anchor=%s reason=%s",
+            successful,
+            frames,
+            len(ordered_receipts),
+            anchor_found,
+            coverage_reason,
+        )
+        return ServiceNotificationScanResult(
+            available=True,
+            successful=successful,
+            receipts=ordered_receipts,
+            frames=frames,
+            anchor_found=anchor_found,
+            coverage_reason=coverage_reason,
+        )
 
     def _prepare_window(self, window_id: str) -> bool:
         return all(
@@ -1169,6 +1751,33 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
     signatures = {path: file_signature(path) for path in trigger_paths}
     capture = LinuxCapture(platform, config)
     runtime = AgentRuntime(config)
+    service_state_value = runtime_config.get(
+        "service_notification_state_file"
+    )
+    service_state_path = (
+        resolve_path(str(service_state_value), config)
+        if service_state_value
+        else runtime.spool.root / "service-notification-state.json"
+    )
+    service_state = ServiceNotificationState(
+        service_state_path,
+        int(runtime_config.get("service_notification_state_max_ids", 512)),
+    )
+    if not service_state.initialized:
+        provider = str(config["channel"].get("provider") or "wxpay")
+        channel_id = str(config["channel"]["id"])
+        prefix = f"{provider}|{channel_id}|txn|"
+        recovered_ids = [
+            key.removeprefix(prefix)
+            for key in runtime.dedupe.values
+            if key.startswith(prefix)
+        ]
+        if recovered_ids:
+            service_state.commit(recovered_ids)
+            LOG.info(
+                "wechat_service_state_recovered transaction_ids=%s",
+                len(recovered_ids),
+            )
 
     LOG.info(
         "agent_started platform=linux agent_id=%s triggers=%s "
@@ -1318,6 +1927,12 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
         if active_trigger is not None and now_mono >= trigger_due:
             started = time.monotonic()
             capture_exception: Exception | None = None
+            fallback_exception: Exception | None = None
+            service_result: ServiceNotificationScanResult | None = None
+            service_baseline = not service_state.initialized
+            service_discovered_ids: list[str] = []
+            service_candidate_count = 0
+            fallback_attempted = False
             recovery_reasons = {
                 "startup_recovery",
                 "restored_trigger",
@@ -1331,32 +1946,108 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
             candidates: list[tuple[PaymentEvent, str]] = []
             try:
                 parser = _parser_for_age(config, max_event_age)
-                candidates = list(
-                    process_capture_segments(
-                        capture=capture,
-                        parser=parser,
-                        trigger_time=active_trigger.trigger_time,
-                        trigger_signature=active_trigger.signature,
-                        ignore_freshness=False,
-                    )
+                service_result = capture.capture_service_notifications(
+                    state=service_state,
+                    trigger_time=active_trigger.trigger_time,
+                    timezone=parser.timezone,
+                    baseline_only=service_baseline,
                 )
+                service_discovered_ids = [
+                    receipt.external_txn_id
+                    for receipt in service_result.receipts
+                ]
+                if service_result.available:
+                    if service_baseline:
+                        LOG.info(
+                            "wechat_service_baseline receipts=%s frames=%s",
+                            len(service_discovered_ids),
+                            service_result.frames,
+                        )
+                    else:
+                        service_events, service_reason = (
+                            parser.events_from_service_notifications(
+                                service_result.receipts,
+                                trigger_time=active_trigger.trigger_time,
+                                source=(
+                                    "wechat-linux-service-notification-ocr"
+                                ),
+                                known_transaction_ids=(
+                                    service_state.transaction_ids
+                                ),
+                            )
+                        )
+                        service_candidate_count = len(service_events)
+                        candidates.extend(service_events)
+                        if not service_events:
+                            LOG.info(
+                                "wechat_service_no_new_receipt reason=%s",
+                                service_reason or "known_or_not_found",
+                            )
             except Exception as exc:
                 capture_exception = exc
                 LOG.exception(
-                    "capture_cycle_failed reason=%s",
+                    "wechat_service_capture_cycle_failed reason=%s",
                     active_trigger.reason,
                 )
-            finally:
-                capture.prune_capture_screenshots()
+
+            run_fallback = bool(
+                service_baseline
+                or service_result is None
+                or not service_result.available
+                or not service_result.successful
+                or service_candidate_count == 0
+            )
+            if run_fallback:
+                fallback_attempted = True
+                try:
+                    parser = _parser_for_age(config, max_event_age)
+                    candidates.extend(
+                        process_capture_segments(
+                            capture=capture,
+                            parser=parser,
+                            trigger_time=active_trigger.trigger_time,
+                            trigger_signature=active_trigger.signature,
+                            ignore_freshness=False,
+                        )
+                    )
+                except Exception as exc:
+                    fallback_exception = exc
+                    if capture_exception is None:
+                        capture_exception = exc
+                    LOG.exception(
+                        "fallback_capture_cycle_failed reason=%s",
+                        active_trigger.reason,
+                    )
+
+            capture.prune_capture_screenshots()
 
             queued_ids: list[str] = []
             for event, receipt_key in candidates:
                 if runtime.queue(event, receipt_key):
                     queued_ids.append(event.event_id)
 
-            scan_successful = capture_scan_can_clear(
-                capture,
-                capture_exception,
+            if (
+                service_result is not None
+                and service_result.available
+                and service_result.successful
+            ):
+                # Queue persistence precedes cursor advancement, so a restart
+                # cannot lose a captured event that has not reached the bridge.
+                service_state.commit(service_discovered_ids)
+
+            service_scan_successful = bool(
+                service_result is None
+                or not service_result.available
+                or service_result.successful
+            )
+            fallback_scan_successful = bool(
+                not fallback_attempted
+                or capture_scan_can_clear(capture, fallback_exception)
+            )
+            scan_successful = bool(
+                capture_exception is None
+                and service_scan_successful
+                and fallback_scan_successful
             )
             if scan_successful:
                 trigger_store.clear(active_trigger.signature)
@@ -1365,7 +2056,8 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
                 refreshed = capture.probe_fingerprint()
                 if refreshed:
                     if (
-                        capture.last_bottom_fingerprint is not None
+                        fallback_attempted
+                        and capture.last_bottom_fingerprint is not None
                         and not capture.screen_fingerprints_equal(
                             refreshed,
                             capture.last_bottom_fingerprint,
@@ -1393,7 +2085,14 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
                     active_trigger.reason,
                     active_trigger.signature,
                     int(capture_retry_seconds),
-                    capture.last_capture_failure_reason
+                    (
+                        service_result.coverage_reason
+                        if service_result is not None
+                        and service_result.available
+                        and not service_result.successful
+                        else None
+                    )
+                    or capture.last_capture_failure_reason
                     or (
                         type(capture_exception).__name__
                         if capture_exception is not None

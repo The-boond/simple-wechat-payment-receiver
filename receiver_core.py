@@ -101,6 +101,16 @@ class MerchantTextReceipt:
     raw_text: str
 
 
+@dataclass(frozen=True)
+class ServiceNotificationReceipt:
+    """One complete 微信收款商业版 service-notification card."""
+
+    occurred_at: int
+    amount: str
+    external_txn_id: str
+    raw_text: str
+
+
 def load_json(path: str | Path) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     value = json.loads(config_path.read_text(encoding="utf-8-sig"))
@@ -476,6 +486,108 @@ def merchant_parser_text(
     return text
 
 
+def service_notification_receipts(
+    text: str,
+    *,
+    trigger_time: int,
+    timezone: ZoneInfo,
+) -> list[ServiceNotificationReceipt]:
+    """Extract exact-time receipts with a durable WeChat transaction ID.
+
+    OCR can misread the large headline amount while preserving the smaller
+    order-amount row. The transaction ID follows both, so the final canonical
+    decimal before that ID is the strongest amount signal. Daily totals appear
+    after the ID and are intentionally excluded.
+    """
+
+    normalized = normalize_ocr_text(text)
+    headers = list(re.finditer(r"收款通知", normalized))
+    timestamp_re = re.compile(
+        r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
+        r"(?P<hour>\d{1,2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    )
+    transaction_re = re.compile(
+        r"(?<![0-9Oo])(?P<transaction>[4][0-9Oo]{23,35})(?![0-9Oo])"
+    )
+    amount_re = re.compile(
+        r"[￥¥YVxX]?(?P<amount>[0-9Oo]{1,6}[.][0-9Oo]{1,2})"
+    )
+    receipts: dict[str, ServiceNotificationReceipt] = {}
+    current = datetime.fromtimestamp(trigger_time, timezone)
+
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(normalized)
+        block = normalized[header.start() : min(end, header.start() + 2600)]
+        timestamp_match = timestamp_re.search(block)
+        if timestamp_match is None:
+            continue
+        transaction_match = transaction_re.search(block, timestamp_match.end())
+        if transaction_match is None:
+            continue
+        transaction_id = transaction_match.group("transaction").translate(
+            str.maketrans({"O": "0", "o": "0"})
+        )
+        if not transaction_id.isdigit():
+            continue
+
+        amount_matches = list(
+            amount_re.finditer(
+                block,
+                timestamp_match.end(),
+                transaction_match.start(),
+            )
+        )
+        if not amount_matches:
+            continue
+        try:
+            amount = canonical_money(amount_matches[-1].group("amount"))
+            values = {
+                name: int(timestamp_match.group(name))
+                for name in ("month", "day", "hour", "minute", "second")
+            }
+            stamp = int(
+                datetime(
+                    current.year,
+                    values["month"],
+                    values["day"],
+                    values["hour"],
+                    values["minute"],
+                    values["second"],
+                    tzinfo=timezone,
+                ).timestamp()
+            )
+            if stamp > trigger_time + 86400:
+                stamp = int(
+                    datetime(
+                        current.year - 1,
+                        values["month"],
+                        values["day"],
+                        values["hour"],
+                        values["minute"],
+                        values["second"],
+                        tzinfo=timezone,
+                    ).timestamp()
+                )
+        except (OverflowError, ValueError):
+            continue
+
+        receipt = ServiceNotificationReceipt(
+            occurred_at=stamp,
+            amount=amount,
+            external_txn_id=transaction_id,
+            raw_text=block,
+        )
+        previous = receipts.get(transaction_id)
+        if previous is None or len(receipt.raw_text) > len(previous.raw_text):
+            receipts[transaction_id] = receipt
+
+    return sorted(
+        receipts.values(),
+        key=lambda receipt: (receipt.occurred_at, receipt.external_txn_id),
+        reverse=True,
+    )
+
+
 class ReceiptParser:
     def __init__(self, config: Mapping[str, Any]):
         parser = config.get("parser", {})
@@ -654,6 +766,74 @@ class ReceiptParser:
             return None, reason
         return min(events, key=lambda row: abs(trigger_time - row[0].occurred_at))
 
+    def events_from_service_notifications(
+        self,
+        receipts: Sequence[ServiceNotificationReceipt],
+        *,
+        trigger_time: int,
+        source: str,
+        known_transaction_ids: Sequence[str] = (),
+        ignore_freshness: bool = False,
+    ) -> tuple[list[tuple[PaymentEvent, str]], str]:
+        """Build stable events for detailed cards not present in the cursor."""
+
+        known = set(known_transaction_ids)
+        emitted: set[str] = set()
+        events: list[tuple[PaymentEvent, str]] = []
+        stale_reasons: list[str] = []
+        for receipt in sorted(
+            receipts,
+            key=lambda item: (item.occurred_at, item.external_txn_id),
+        ):
+            transaction_id = receipt.external_txn_id
+            if transaction_id in known or transaction_id in emitted:
+                continue
+            emitted.add(transaction_id)
+            age = trigger_time - receipt.occurred_at
+            if not ignore_freshness and (
+                age > self.max_age or age < -self.max_future
+            ):
+                stale_reasons.append(
+                    f"stale age_seconds={age} transaction_sha256="
+                    + hashlib.sha256(transaction_id.encode()).hexdigest()[:12]
+                )
+                continue
+
+            receipt_key = (
+                f"{self.provider}|{self.channel_id}|txn|{transaction_id}"
+            )
+            event_id = "evt_" + hashlib.sha256(
+                receipt_key.encode("utf-8")
+            ).hexdigest()[:32]
+            shown = datetime.fromtimestamp(
+                receipt.occurred_at,
+                self.timezone,
+            ).strftime("%m-%d %H:%M:%S")
+            raw_text = (
+                receipt.raw_text[:4000]
+                if self.include_raw_text
+                else f"微信收款通知 ￥{receipt.amount}元 时间 {shown}"
+            )
+            events.append(
+                (
+                    PaymentEvent(
+                        event_id=event_id,
+                        provider=self.provider,
+                        channel_id=self.channel_id,
+                        amount=receipt.amount,
+                        occurred_at=receipt.occurred_at,
+                        external_txn_id=transaction_id,
+                        trade_no=None,
+                        payer=None,
+                        raw_text=raw_text,
+                        source=source,
+                        agent_id=self.agent_id,
+                    ),
+                    receipt_key,
+                )
+            )
+        return events, stale_reasons[0] if stale_reasons and not events else ""
+
 
 class CaptureTriggerStore:
     """Single-slot durable trigger that survives an agent process restart."""
@@ -780,6 +960,67 @@ class ReceiptDedupe:
         os.replace(temporary, self.path)
 
 
+class ServiceNotificationState:
+    """Persistent transaction-ID anchor for height-independent chat scans."""
+
+    def __init__(self, path: Path, max_transaction_ids: int = 512):
+        self.path = path.expanduser().resolve()
+        self.max_transaction_ids = max(32, int(max_transaction_ids))
+        self.transaction_ids: tuple[str, ...] = ()
+        self.initialized = False
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            values = raw.get("transaction_ids") if isinstance(raw, dict) else None
+            if isinstance(values, list):
+                cleaned: list[str] = []
+                for value in values:
+                    transaction_id = str(value).strip()
+                    if (
+                        transaction_id.isdigit()
+                        and transaction_id.startswith("4")
+                        and 24 <= len(transaction_id) <= 36
+                        and transaction_id not in cleaned
+                    ):
+                        cleaned.append(transaction_id)
+                self.transaction_ids = tuple(
+                    cleaned[: self.max_transaction_ids]
+                )
+                self.initialized = bool(raw.get("initialized", True))
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def commit(self, transaction_ids: Sequence[str]) -> None:
+        combined: list[str] = []
+        for value in (*transaction_ids, *self.transaction_ids):
+            transaction_id = str(value).strip()
+            if (
+                transaction_id.isdigit()
+                and transaction_id.startswith("4")
+                and 24 <= len(transaction_id) <= 36
+                and transaction_id not in combined
+            ):
+                combined.append(transaction_id)
+        self.transaction_ids = tuple(
+            combined[: self.max_transaction_ids]
+        )
+        self.initialized = True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "initialized": True,
+                    "transaction_ids": list(self.transaction_ids),
+                    "updated_at": int(time.time()),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.path)
+
+
 class BridgeClient:
     def __init__(self, config: Mapping[str, Any]):
         bridge = config["bridge"]
@@ -788,7 +1029,7 @@ class BridgeClient:
         self.timeout = float(bridge.get("timeout_seconds", 10))
         self.user_agent = str(
             bridge.get("user_agent")
-            or "Simple-WeChat-Payment-Receiver/1.2"
+            or "Simple-WeChat-Payment-Receiver/1.3"
         )
 
     def send(self, event: PaymentEvent) -> dict[str, Any]:
@@ -860,7 +1101,12 @@ class AgentRuntime:
 
     def queue(self, event: PaymentEvent, receipt_key: str) -> bool:
         if self.dedupe.contains(receipt_key):
-            LOG.info("receipt_duplicate key=%s", receipt_key)
+            display_key = receipt_key
+            if "|txn|" in receipt_key:
+                display_key = "transaction-sha256:" + hashlib.sha256(
+                    receipt_key.encode("utf-8")
+                ).hexdigest()[:12]
+            LOG.info("receipt_duplicate key=%s", display_key)
             return False
         self.spool.put(event)
         self.pending[event.event_id] = (event, 0.0, 0, None)

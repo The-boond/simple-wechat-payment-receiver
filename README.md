@@ -21,6 +21,9 @@
 - 先快速截完全部滚动位置并回到底部，再做 OCR 和网络上报，减少突发到账期间的截屏空窗。
 - 单次 OCR 周期可提取多张到账卡片，适应短时间连续付款。
 - 商家助手使用坐标化时钟/金额证据、逐卡边界和局部二次确认，抑制金额数字冲突。
+- 可选的 `Service Notifications` 详细卡片链路读取秒级时间和微信交易单号，
+  按持久交易锚点动态滚动，不受单张卡片高度和固定截图数量限制。
+- 详细卡片扫描后回到底部复查新消息；候选先写 spool，再推进交易游标。
 - HMAC-SHA256 签名、事件 ID、持久 spool、指数退避和幂等重试。
 - 过期 `no_candidate` 自动进入 rejected 归档，不会无限占用重试队列。
 - 默认不保存完整 OCR 文本或截图。
@@ -84,6 +87,10 @@ X-Bridge-Signature: HMAC_SHA256(secret, timestamp + "." + raw_json_body)
 
 重复事件可返回 `ok=true, result=already_processed`。临时失败返回 `ok=false`，Agent 会保留 pending 并重试。
 
+普通收款助手卡片没有交易单号时，`external_txn_id` 为 `null`。启用详细
+服务通知链路且完整识别卡片后，该字段为微信交易单号，`event_id` 也由该
+交易单号稳定派生。
+
 ## 公共配置
 
 复制对应示例：
@@ -115,6 +122,8 @@ cp configs/linux.example.json config.json
 - `runtime.poll_seconds`
 - `runtime.spool_dir`
 - `runtime.capture_trigger_file`：未完成截图周期的单槽持久记录
+- `runtime.service_notification_state_file`：详细服务通知的持久交易锚点
+- `runtime.service_notification_state_max_ids`：保留的交易单号数量，默认 512
 - `runtime.no_candidate_max_age_seconds`：无候选事件的最长保留时间，默认 2100 秒
 - `runtime.retry_max_age_seconds`：传输失败事件的最长保留时间，默认 86400 秒
 - `trigger_quiet_seconds`：WAL 最后一次变化后的静默等待，避免文件仍在写入时过早 OCR
@@ -129,6 +138,8 @@ cp configs/linux.example.json config.json
 
 - `微信收款助手` 的“经营码收款到账通知 + 完整日期时间”卡片。
 - `微信支付商家助手` 的“HH:MM + 收款通知 + 金额”卡片。
+- 主微信 `Service Notifications` 中包含秒级时间、订单金额和微信交易单号的
+  `微信收款商业版` 详细卡片。
 
 针对商家助手卡片中对比度较低的浅灰色时间，Linux Agent 会对聊天中轴
 区域做多阈值放大 OCR，并保留单词纵坐标。每个大号金额与最近的前置聊天
@@ -167,6 +178,12 @@ sudo apt-get install -y python3 tesseract-ocr tesseract-ocr-chi-sim \
 使其成为标题为 `微信支付商家助手` 的独立窗口。保留旧二维码期间，可同时
 打开 `微信支付商家助手` 和 `微信收款助手`，Agent 会按配置顺序逐个采集。
 
+若要启用详细卡片链路，先在主微信窗口打开 `Service Notifications` 会话，
+再将 `linux.service_notifications.enabled` 设为 `true`。该链路使用主窗口
+root compositor 截图，避免 Linux 微信嵌入区域被直接 X11 截成黑块；默认
+坐标适用于 `1440 × 900` 桌面，可按实际分辨率调整窗口和 OCR 裁剪参数。
+扫描只移动鼠标并使用滚轮，不点击收款卡片。
+
 检查配置：
 
 ```bash
@@ -184,6 +201,13 @@ python3 linux_agent.py --config config.json
 ### 连续多笔付款
 
 每次触发后，Agent 先从会话底部按配置的重叠步长快速截图，遇到重复画面或达到有界帧数后回到底部；随后按截图顺序 OCR。这样 OCR 或接口响应变慢时，微信窗口也不会长时间停在历史位置。全部候选先写入持久 spool，完整截图周期结束后再发送；相邻滚动位置重复出现的同一张卡片会被去重。
+
+详细服务通知链路按短批次先截图、后 OCR。首次启用只读取
+`baseline_frames` 建立交易单号基线，不上报现有卡片；后续从底部向上扫描，
+直到读到持久化的已知交易单号或重复画面。`scan_max_frames` 只是异常状态
+的安全熔断值，不是正常覆盖范围。扫描期间新到的卡片由回到底部后的尾部
+复查补入。若详细窗口缺失、扫描失败或没有新候选，原独立收款窗口链路继续
+兜底。
 
 `ocr_workers` 默认并保持为 `1`。只有在目标主机上用自有测试帧验证 CPU、
 内存和单帧耗时都留有余量时，再尝试设为 `2`；实现会把并发硬限制在 2，

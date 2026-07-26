@@ -3,7 +3,7 @@
     "url": "https://YOUR_DOMAIN.example/api/payment/event",
     "token_env": "WECHAT_RECEIVER_TOKEN",
     "timeout_seconds": 10,
-    "user_agent": "Simple-WeChat-Payment-Receiver/1.2"
+    "user_agent": "Simple-WeChat-Payment-Receiver/1.3"
   },
   "agent": {
     "id": "linux-collector-01"
@@ -17,6 +17,8 @@
     "spool_dir": "spool/linux",
     "dedupe_file": "spool/linux/receipt-dedupe.json",
     "capture_trigger_file": "spool/linux/capture-trigger.json",
+    "service_notification_state_file": "spool/linux/service-notification-state.json",
+    "service_notification_state_max_ids": 512,
     "max_retry_seconds": 300,
     "no_candidate_max_age_seconds": 2100,
     "retry_max_age_seconds": 86400
@@ -68,6 +70,28 @@
     "keep_screenshots": false,
     "screenshot_retention_days": 7,
     "screenshot_max_files": 2000,
+    "service_notifications": {
+      "enabled": false,
+      "window_name_regex": "^Weixin$",
+      "close_overlay_name_regex": "^微信收款商业版$",
+      "window_x": 420,
+      "window_y": 20,
+      "window_width": 1020,
+      "window_height": 860,
+      "pointer_x": 760,
+      "pointer_y": 430,
+      "ocr_crop_x": 400,
+      "ocr_crop_y": 40,
+      "ocr_crop_width": 580,
+      "ocr_crop_height": 810,
+      "scroll_up_clicks": 6,
+      "scroll_down_clicks": 100,
+      "scan_batch_frames": 4,
+      "baseline_frames": 8,
+      "scan_max_frames": 160,
+      "settle_seconds": 0.3,
+      "tail_recheck_seconds": 0.45
+    },
     "capture_attempts": [
       {"delay_seconds": 2, "scroll_up_clicks": 0},
       {"delay_seconds": 5, "scroll_up_clicks": 2},
