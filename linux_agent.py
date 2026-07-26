@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux agent: WAL-triggered X11 capture + Tesseract OCR."""
+"""Linux agent: durable WAL triggers, fast X11 capture and bounded OCR."""
 
 from __future__ import annotations
 
@@ -10,28 +10,138 @@ import os
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from receiver_core import (
     AgentRuntime,
+    CaptureTriggerStore,
+    FileSignature,
     OCR_CAPTURE_SEPARATOR,
-    OCR_LATEST_CLOCK_PREFIX,
+    PaymentEvent,
     ReceiptParser,
+    VisualAmount,
+    VisualClock,
+    VisualToken,
+    associate_visual_receipts,
     discover_trigger_files,
     file_signature,
+    format_file_signature,
     load_json,
+    merchant_parser_text,
     normalize_ocr_text,
+    parse_tesseract_tsv,
     resolve_path,
     setup_logging,
+    trigger_file_change,
     validate_config,
+    visual_amount_from_token,
+    visual_clock_from_token,
 )
 
 
 LOG = logging.getLogger("wechat-payment-receiver.linux")
 
 
+@dataclass(frozen=True)
+class CapturedFrame:
+    window_label: str
+    window_id: str
+    screenshot: Path
+    attempt: int
+    scroll_up_clicks: int
+
+
+@dataclass(frozen=True)
+class OcrFrameResult:
+    frame: CapturedFrame
+    text: str | None
+    elapsed_ms: int
+    error: str | None
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def command(
+    args: Sequence[str],
+    *,
+    timeout: float = 20.0,
+    input_text: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a text subprocess and turn timeouts/start failures into results."""
+
+    command_args = list(args)
+    try:
+        return subprocess.run(
+            command_args,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env=dict(env) if env is not None else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        LOG.warning(
+            "subprocess_timeout command=%s timeout_seconds=%s",
+            command_args[0] if command_args else "",
+            timeout,
+        )
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return subprocess.CompletedProcess(
+            command_args,
+            124,
+            stdout,
+            (stderr + f"\ncommand timed out after {timeout} seconds").strip(),
+        )
+    except OSError as exc:
+        LOG.warning(
+            "subprocess_start_failed command=%s error=%s",
+            command_args[0] if command_args else "",
+            exc,
+        )
+        return subprocess.CompletedProcess(command_args, 127, "", str(exc))
+
+
+def attempt_plan(platform: Mapping[str, Any]) -> list[dict[str, float | int]]:
+    """Return the legacy retry plan used by older configurations/tools."""
+
+    raw = platform.get("capture_attempts")
+    if not isinstance(raw, list) or not raw:
+        return [
+            {"delay_seconds": 2.0, "scroll_up_clicks": 0},
+            {"delay_seconds": 5.0, "scroll_up_clicks": 2},
+            {"delay_seconds": 9.0, "scroll_up_clicks": 4},
+        ]
+    result: list[dict[str, float | int]] = []
+    for row in raw:
+        if not isinstance(row, Mapping):
+            raise ValueError("linux.capture_attempts entries must be objects")
+        result.append(
+            {
+                "delay_seconds": max(0.5, float(row.get("delay_seconds", 2))),
+                "scroll_up_clicks": max(
+                    0,
+                    int(row.get("scroll_up_clicks", 0)),
+                ),
+            }
+        )
+    return sorted(result, key=lambda row: float(row["delay_seconds"]))
+
+
 class LinuxCapture:
+    """Capture every scroll frame first, then OCR immutable screenshots."""
+
     def __init__(self, config: Mapping[str, Any], full_config: Mapping[str, Any]):
         self.display = str(config.get("display") or ":88")
         raw_window_regexes = config.get("window_name_regexes")
@@ -45,106 +155,108 @@ class LinuxCapture:
             window_regexes = []
         if not window_regexes:
             window_regexes = [
-                str(
-                    config.get("window_name_regex")
-                    or "^微信收款助手$"
-                ).strip()
+                str(config.get("window_name_regex") or "^微信收款助手$").strip()
             ]
         self.window_name_regexes = tuple(dict.fromkeys(window_regexes))
-        # Backward-compatible attribute used by existing diagnostics.
         self.window_name_regex = self.window_name_regexes[0]
+
         self.window_probe = str(config.get("window_probe") or "xdotool")
         self.capture_tool = str(config.get("capture_tool") or "import")
+        self.convert_tool = str(config.get("convert_tool") or "convert")
         self.ocr_tool = str(config.get("ocr_tool") or "tesseract")
         self.ocr_language = str(config.get("ocr_language") or "chi_sim+eng")
-        self.ocr_psm = int(config.get("ocr_psm", 6))
-        self.scroll_down_clicks = max(0, int(config.get("scroll_down_clicks", 40)))
+        self.ocr_psm = max(3, min(13, int(config.get("ocr_psm", 6))))
+        self.ocr_workers = max(1, min(2, int(config.get("ocr_workers", 1))))
+
         self.window_width = max(620, int(config.get("window_width", 720)))
         self.window_height = max(660, int(config.get("window_height", 860)))
         self.window_x = max(0, int(config.get("window_x", 0)))
         self.window_y = max(0, int(config.get("window_y", 0)))
-        self.keep_screenshots = config.get("keep_screenshots") is True
-        self.capture_dir = resolve_path(str(config.get("capture_dir") or "captures"), full_config)
+        self.scroll_down_clicks = max(
+            0,
+            int(config.get("scroll_down_clicks", 40)),
+        )
+        raw_scroll_attempts = config.get("scroll_up_attempts")
+        if isinstance(raw_scroll_attempts, list) and raw_scroll_attempts:
+            scroll_attempts = [max(0, int(value)) for value in raw_scroll_attempts]
+        else:
+            scroll_attempts = [
+                int(row["scroll_up_clicks"]) for row in attempt_plan(config)
+            ]
+        self.scroll_up_attempts = tuple(dict.fromkeys(scroll_attempts))
+        self.adaptive_scroll_enabled = _as_bool(
+            config.get("adaptive_scroll_enabled"),
+            default=True,
+        )
+        self.adaptive_scroll_clicks = max(
+            1,
+            int(config.get("adaptive_scroll_clicks", 4)),
+        )
+        self.adaptive_scroll_max_frames = max(
+            3,
+            min(12, int(config.get("adaptive_scroll_max_frames", 6))),
+        )
+
+        self.capture_timeout = max(
+            3.0,
+            min(60.0, float(config.get("capture_timeout_seconds", 15))),
+        )
+        self.ocr_timeout = max(
+            5.0,
+            min(120.0, float(config.get("ocr_timeout_seconds", 30))),
+        )
+        self.probe_timeout = max(
+            3.0,
+            min(60.0, float(config.get("probe_timeout_seconds", 15))),
+        )
+
+        raw_thresholds = config.get("clock_probe_thresholds", [82, 76, 88])
+        if not isinstance(raw_thresholds, list):
+            raw_thresholds = [raw_thresholds]
+        thresholds: list[int] = []
+        for value in raw_thresholds:
+            try:
+                thresholds.append(max(55, min(95, int(value))))
+            except (TypeError, ValueError):
+                continue
+        self.clock_probe_thresholds = tuple(dict.fromkeys(thresholds or [82]))
+        self.screen_probe_hamming_threshold = max(
+            0,
+            min(16, int(config.get("screen_probe_hamming_threshold", 3))),
+        )
+
+        self.keep_screenshots = _as_bool(config.get("keep_screenshots"), False)
+        self.capture_dir = resolve_path(
+            str(config.get("capture_dir") or "captures"),
+            full_config,
+        )
         self.capture_dir.mkdir(parents=True, exist_ok=True)
+        self.screenshot_retention_seconds = max(
+            3600,
+            int(float(config.get("screenshot_retention_days", 7)) * 86400),
+        )
+        self.screenshot_max_files = max(
+            1,
+            int(config.get("screenshot_max_files", 2000)),
+        )
+
+        self.last_capture_successful = False
+        self.last_capture_frames = 0
+        self.last_capture_failure_reason: str | None = None
+        self.last_bottom_fingerprint: str | None = None
 
     def _environment(self) -> dict[str, str]:
         env = os.environ.copy()
         env["DISPLAY"] = self.display
         return env
 
-    def _run(self, args: Sequence[str], timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            list(args), text=True, capture_output=True, timeout=timeout, check=False, env=self._environment()
-        )
-
-    def _latest_clock_probe(self, screenshot: Path) -> str | None:
-        """Recover the newest pale HH:MM clock from the chat center strip."""
-        strip = screenshot.with_name(screenshot.stem + "-clock-strip.png")
-        crop_width = max(180, min(320, int(self.window_width * 0.31)))
-        crop_x = max(0, (self.window_width - crop_width) // 2)
-        started = time.monotonic()
-        try:
-            enhanced = self._run(
-                [
-                    "convert",
-                    str(screenshot),
-                    "-crop",
-                    f"{crop_width}x{self.window_height}+{crop_x}+0",
-                    "+repage",
-                    "-resize",
-                    "300%",
-                    "-colorspace",
-                    "Gray",
-                    "-threshold",
-                    "82%",
-                    str(strip),
-                ],
-                timeout=15,
-            )
-            if enhanced.returncode != 0 or not strip.exists():
-                LOG.debug(
-                    "wechat_clock_probe_convert_failed error=%s",
-                    enhanced.stderr[:300],
-                )
-                return None
-            clock_ocr = self._run(
-                [
-                    self.ocr_tool,
-                    str(strip),
-                    "stdout",
-                    "-l",
-                    "eng",
-                    "--psm",
-                    "11",
-                ],
-                timeout=15,
-            )
-            if clock_ocr.returncode != 0:
-                LOG.debug(
-                    "wechat_clock_probe_ocr_failed error=%s",
-                    clock_ocr.stderr[:300],
-                )
-                return None
-            clocks: list[str] = []
-            for hour_text, minute_text in re.findall(
-                r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)",
-                clock_ocr.stdout,
-            ):
-                hour = int(hour_text)
-                minute = int(minute_text)
-                if 0 <= hour <= 23 and 0 <= minute <= 59:
-                    clocks.append(f"{hour:02d}:{minute:02d}")
-            if not clocks:
-                return None
-            latest = clocks[-1]
-            LOG.info(
-                "wechat_clock_probe clock=%s elapsed_ms=%s",
-                latest,
-                int((time.monotonic() - started) * 1000),
-            )
-            return latest
-        finally:
-            strip.unlink(missing_ok=True)
+    def _run(
+        self,
+        args: Sequence[str],
+        *,
+        timeout: float = 20.0,
+    ) -> subprocess.CompletedProcess[str]:
+        return command(args, timeout=timeout, env=self._environment())
 
     def find_windows(self) -> list[tuple[str, str]]:
         windows: list[tuple[str, str]] = []
@@ -168,242 +280,1181 @@ class LinuxCapture:
         windows = self.find_windows()
         return windows[0][1] if windows else None
 
-    def _capture_window(
+    def _xdotool(self, *args: str) -> bool:
+        result = self._run([self.window_probe, *args], timeout=10)
+        if result.returncode == 0:
+            return True
+        LOG.warning(
+            "wechat_xdotool_failed args=%s error=%s",
+            args,
+            result.stderr[:500],
+        )
+        return False
+
+    def _prepare_window(self, window_id: str) -> bool:
+        return all(
+            (
+                self._xdotool("windowactivate", "--sync", window_id),
+                self._xdotool(
+                    "windowsize",
+                    "--sync",
+                    window_id,
+                    str(self.window_width),
+                    str(self.window_height),
+                ),
+                self._xdotool(
+                    "windowmove",
+                    "--sync",
+                    window_id,
+                    str(self.window_x),
+                    str(self.window_y),
+                ),
+                self._xdotool(
+                    "mousemove",
+                    "--window",
+                    window_id,
+                    "300",
+                    "350",
+                ),
+            )
+        )
+
+    def _return_to_bottom(self, window_id: str, window_label: str) -> bool:
+        moved = self._xdotool(
+            "mousemove",
+            "--window",
+            window_id,
+            "300",
+            "350",
+        )
+        end_sent = self._xdotool("key", "--window", window_id, "End")
+        restore_clicks = max(
+            self.scroll_down_clicks,
+            self.adaptive_scroll_clicks
+            * (self.adaptive_scroll_max_frames + 1),
+            max(self.scroll_up_attempts, default=0)
+            + self.adaptive_scroll_clicks,
+            8,
+        )
+        scrolled = self._xdotool(
+            "click",
+            "--repeat",
+            str(restore_clicks),
+            "--delay",
+            "35",
+            "5",
+        )
+        restored = bool(moved and scrolled)
+        LOG.info(
+            "wechat_scroll_bottom_restored window=%s clicks=%s "
+            "end_sent=%s ok=%s",
+            window_label,
+            restore_clicks,
+            end_sent,
+            restored,
+        )
+        return restored
+
+    def _run_binary(
+        self,
+        args: Sequence[str],
+        *,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[bytes] | None:
+        try:
+            return subprocess.run(
+                list(args),
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=self._environment(),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOG.debug("binary_command_failed command=%s error=%s", args[0], exc)
+            return None
+
+    def _visual_fingerprint_file(self, screenshot: Path) -> str | None:
+        """Hash stable chat pixels for repeated-frame detection."""
+
+        chat_x = max(0, int(self.window_width * 0.20))
+        chat_y = min(100, max(0, self.window_height // 10))
+        chat_width = max(320, int(self.window_width * 0.60))
+        chat_height = max(480, self.window_height - chat_y - 60)
+        result = self._run_binary(
+            [
+                self.convert_tool,
+                str(screenshot),
+                "-crop",
+                f"{chat_width}x{chat_height}+{chat_x}+{chat_y}",
+                "+repage",
+                "-resize",
+                "64x64!",
+                "-colorspace",
+                "Gray",
+                "-depth",
+                "8",
+                "gray:-",
+            ],
+            timeout=self.probe_timeout,
+        )
+        if result is None or result.returncode != 0 or not result.stdout:
+            return None
+        return hashlib.sha256(result.stdout).hexdigest()
+
+    def _screen_probe_fingerprint_file(self, screenshot: Path) -> str | None:
+        """Return a noise-resistant 64-bit dHash for periodic recovery."""
+
+        chat_x = max(0, int(self.window_width * 0.20))
+        chat_y = min(100, max(0, self.window_height // 10))
+        chat_width = max(320, int(self.window_width * 0.60))
+        chat_height = max(480, self.window_height - chat_y - 60)
+        result = self._run_binary(
+            [
+                self.convert_tool,
+                str(screenshot),
+                "-crop",
+                f"{chat_width}x{chat_height}+{chat_x}+{chat_y}",
+                "+repage",
+                "-resize",
+                "9x8!",
+                "-colorspace",
+                "Gray",
+                "-blur",
+                "0x0.8",
+                "-depth",
+                "8",
+                "gray:-",
+            ],
+            timeout=self.probe_timeout,
+        )
+        if result is None or result.returncode != 0 or len(result.stdout) < 72:
+            return None
+        pixels = result.stdout
+        value = 0
+        for row in range(8):
+            offset = row * 9
+            for column in range(8):
+                value = (value << 1) | int(
+                    pixels[offset + column] > pixels[offset + column + 1]
+                )
+        return f"{value:016x}"
+
+    def screen_fingerprints_equal(
+        self,
+        first: str | None,
+        second: str | None,
+    ) -> bool:
+        if not first or not second:
+            return first == second
+        try:
+            distance = (int(first, 16) ^ int(second, 16)).bit_count()
+        except ValueError:
+            return first == second
+        return distance <= self.screen_probe_hamming_threshold
+
+    def probe_fingerprint(self) -> str | None:
+        """Take one cheap screenshot to recover from a missed WAL trigger."""
+
+        window_id = self.find_window()
+        if not window_id:
+            return None
+        probe = self.capture_dir / f".screen-probe-{os.getpid()}.png"
+        try:
+            captured = self._run(
+                [self.capture_tool, "-window", window_id, str(probe)],
+                timeout=self.capture_timeout,
+            )
+            if captured.returncode != 0 or not probe.exists():
+                return None
+            return self._screen_probe_fingerprint_file(probe)
+        finally:
+            probe.unlink(missing_ok=True)
+
+    def prune_capture_screenshots(
         self,
         *,
+        exclude: Sequence[Path] = (),
+    ) -> tuple[int, int]:
+        """Bound top-level receipt screenshots without touching evidence dirs."""
+
+        excluded = {path.resolve() for path in exclude}
+        cutoff = time.time() - self.screenshot_retention_seconds
+        candidates: list[tuple[Path, float]] = []
+        removed_expired = 0
+        removed_overflow = 0
+        try:
+            paths = list(self.capture_dir.glob("receipt-*.png"))
+        except OSError as exc:
+            LOG.warning("wechat_screenshot_prune_failed error=%s", exc)
+            return 0, 0
+        for path in paths:
+            try:
+                if path.resolve() in excluded or not path.is_file():
+                    continue
+                modified = path.stat().st_mtime
+                if modified < cutoff:
+                    path.unlink(missing_ok=True)
+                    removed_expired += 1
+                else:
+                    candidates.append((path, modified))
+            except OSError as exc:
+                LOG.warning(
+                    "wechat_screenshot_prune_file_failed file=%s error=%s",
+                    path,
+                    exc,
+                )
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        for path, _modified in candidates[self.screenshot_max_files :]:
+            try:
+                path.unlink(missing_ok=True)
+                removed_overflow += 1
+            except OSError as exc:
+                LOG.warning(
+                    "wechat_screenshot_prune_file_failed file=%s error=%s",
+                    path,
+                    exc,
+                )
+        if removed_expired or removed_overflow:
+            LOG.info(
+                "wechat_screenshot_pruned expired=%s overflow=%s retained_limit=%s",
+                removed_expired,
+                removed_overflow,
+                self.screenshot_max_files,
+            )
+        return removed_expired, removed_overflow
+
+    def _tesseract_tsv(self, image: Path) -> list[VisualToken]:
+        result = self._run(
+            [
+                self.ocr_tool,
+                str(image),
+                "stdout",
+                "-l",
+                "eng",
+                "--psm",
+                "11",
+                "tsv",
+            ],
+            timeout=self.ocr_timeout,
+        )
+        return parse_tesseract_tsv(result.stdout) if result.returncode == 0 else []
+
+    def _merchant_amount_candidates(
+        self,
+        screenshot: Path,
+    ) -> list[VisualAmount]:
+        candidates: list[VisualAmount] = []
+        for token in self._tesseract_tsv(screenshot):
+            if token.left < int(self.window_width * 0.17):
+                continue
+            if token.left + token.width > int(self.window_width * 0.83):
+                continue
+            amount = visual_amount_from_token(token)
+            if amount is None:
+                continue
+            if any(
+                existing.amount == amount.amount
+                and abs(existing.center_y - amount.center_y) < 10
+                for existing in candidates
+            ):
+                continue
+            candidates.append(amount)
+        return sorted(candidates, key=lambda item: item.center_y)
+
+    def _clock_probe_candidates(
+        self,
+        screenshot: Path,
+        *,
+        desired_count: int = 1,
+    ) -> list[VisualClock]:
+        del desired_count  # Every threshold is bounded; retain all visible clocks.
+        crop_width = max(180, min(320, int(self.window_width * 0.31)))
+        crop_x = max(0, (self.window_width - crop_width) // 2)
+        resize_factor = 3.0
+        started = time.monotonic()
+        candidates: list[VisualClock] = []
+        for threshold in self.clock_probe_thresholds:
+            strip = screenshot.with_name(
+                screenshot.stem + f"-clock-strip-{threshold}.png"
+            )
+            try:
+                enhanced = self._run(
+                    [
+                        self.convert_tool,
+                        str(screenshot),
+                        "-crop",
+                        f"{crop_width}x{self.window_height}+{crop_x}+0",
+                        "+repage",
+                        "-resize",
+                        "300%",
+                        "-colorspace",
+                        "Gray",
+                        "-threshold",
+                        f"{threshold}%",
+                        str(strip),
+                    ],
+                    timeout=self.probe_timeout,
+                )
+                if enhanced.returncode != 0 or not strip.exists():
+                    continue
+                for token in self._tesseract_tsv(strip):
+                    clock = visual_clock_from_token(
+                        token,
+                        resize_factor=resize_factor,
+                    )
+                    if clock is None:
+                        continue
+                    duplicate = next(
+                        (
+                            existing
+                            for existing in candidates
+                            if existing.clock == clock.clock
+                            and abs(existing.center_y - clock.center_y) < 12
+                        ),
+                        None,
+                    )
+                    if duplicate is None:
+                        candidates.append(clock)
+                    elif clock.confidence > duplicate.confidence:
+                        candidates.remove(duplicate)
+                        candidates.append(clock)
+            finally:
+                strip.unlink(missing_ok=True)
+        candidates.sort(key=lambda item: item.center_y)
+        if candidates:
+            LOG.info(
+                "wechat_clock_probe clocks=%s elapsed_ms=%s",
+                ",".join(clock.clock for clock in candidates),
+                int((time.monotonic() - started) * 1000),
+            )
+        return candidates
+
+    def _confirm_merchant_card(
+        self,
+        screenshot: Path,
+        clock: VisualClock,
+        amount: VisualAmount,
+        *,
+        index: int,
+    ) -> bool:
+        """Confirm each coordinate pair inside its own local card crop."""
+
+        crop_x = max(0, int(self.window_width * 0.20))
+        crop_width = min(
+            self.window_width - crop_x,
+            int(self.window_width * 0.60),
+        )
+        crop_y = max(
+            0,
+            int(clock.center_y + 10),
+            int(amount.center_y - 220),
+        )
+        crop_bottom = min(self.window_height, int(amount.center_y + 170))
+        crop_height = max(120, crop_bottom - crop_y)
+        card = screenshot.with_name(
+            screenshot.stem + f"-card-confirm-{index}.png"
+        )
+        try:
+            cropped = self._run(
+                [
+                    self.convert_tool,
+                    str(screenshot),
+                    "-crop",
+                    f"{crop_width}x{crop_height}+{crop_x}+{crop_y}",
+                    "+repage",
+                    "-resize",
+                    "160%",
+                    str(card),
+                ],
+                timeout=self.probe_timeout,
+            )
+            if cropped.returncode != 0 or not card.exists():
+                return False
+            result = self._run(
+                [
+                    self.ocr_tool,
+                    str(card),
+                    "stdout",
+                    "-l",
+                    self.ocr_language,
+                    "--psm",
+                    "11",
+                ],
+                timeout=self.ocr_timeout,
+            )
+            if result.returncode != 0:
+                return False
+            normalized = normalize_ocr_text(result.stdout)
+            confirmed = (
+                "收款通知" in normalized
+                or (
+                    "收款金额" in normalized
+                    and ("商品名称" in normalized or "收款成功" in normalized)
+                )
+                or ("商品名称" in normalized and "收款成功" in normalized)
+            )
+            LOG.info(
+                "wechat_card_confirmation amount=%s clock=%s confirmed=%s",
+                amount.amount,
+                clock.clock,
+                confirmed,
+            )
+            return confirmed
+        finally:
+            card.unlink(missing_ok=True)
+
+    def _merchant_visual_candidates(
+        self,
+        screenshot: Path,
+    ) -> tuple[
+        list[tuple[VisualClock, VisualAmount]],
+        list[VisualClock],
+        bool,
+    ]:
+        amounts = self._merchant_amount_candidates(screenshot)
+        if not amounts:
+            return [], [], True
+        clocks = self._clock_probe_candidates(
+            screenshot,
+            desired_count=max(1, len(amounts)),
+        )
+        candidate_pairs = associate_visual_receipts(amounts, clocks)
+        pairs = [
+            pair
+            for index, pair in enumerate(candidate_pairs, start=1)
+            if self._confirm_merchant_card(
+                screenshot,
+                pair[0],
+                pair[1],
+                index=index,
+            )
+        ]
+        if pairs:
+            LOG.info(
+                "wechat_visual_receipts candidates=%s",
+                ",".join(
+                    f"{clock.clock}/{amount.amount}" for clock, amount in pairs
+                ),
+            )
+        return pairs, clocks, len(pairs) == len(amounts)
+
+    @staticmethod
+    def _is_merchant_window(window_label: str) -> bool:
+        if "微信支付商家助手" in window_label:
+            return True
+        try:
+            return re.search(window_label, "微信支付商家助手") is not None
+        except re.error:
+            return False
+
+    def _ocr_captured_frame(self, frame: CapturedFrame) -> OcrFrameResult:
+        started = time.monotonic()
+        result = self._run(
+            [
+                self.ocr_tool,
+                str(frame.screenshot),
+                "stdout",
+                "-l",
+                self.ocr_language,
+                "--psm",
+                str(self.ocr_psm),
+            ],
+            timeout=self.ocr_timeout,
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if result.returncode != 0:
+            return OcrFrameResult(
+                frame,
+                None,
+                elapsed_ms,
+                result.stderr[:500],
+            )
+        ocr_text = result.stdout
+        if self._is_merchant_window(frame.window_label):
+            pairs, clocks, allow_fallback = self._merchant_visual_candidates(
+                frame.screenshot
+            )
+            ocr_text = merchant_parser_text(
+                result.stdout,
+                pairs,
+                clocks,
+                allow_clock_fallback=allow_fallback,
+            )
+            if pairs:
+                LOG.info(
+                    "wechat_visual_evidence_selected pairs=%s "
+                    "full_text_sha256=%s",
+                    len(pairs),
+                    hashlib.sha256(
+                        normalize_ocr_text(result.stdout).encode("utf-8")
+                    ).hexdigest()[:16],
+                )
+        return OcrFrameResult(frame, ocr_text, elapsed_ms, None)
+
+    def _capture_screenshot(
+        self,
+        *,
+        window_label: str,
         window_id: str,
-        window_regex: str,
         window_index: int,
+        attempt: int,
         scroll_up_clicks: int,
-    ) -> tuple[str, str] | None:
-        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
-        screenshot = self.capture_dir / f"receipt-{stamp}-w{window_index}.png"
-        self._run([self.window_probe, "windowactivate", "--sync", window_id], timeout=10)
-        self._run([
-            self.window_probe, "windowsize", "--sync", window_id,
-            str(self.window_width), str(self.window_height),
-        ], timeout=10)
-        self._run([
-            self.window_probe, "windowmove", "--sync", window_id,
-            str(self.window_x), str(self.window_y),
-        ], timeout=10)
-        self._run([self.window_probe, "mousemove", "--window", window_id, "300", "350"], timeout=10)
-        if self.scroll_down_clicks:
-            self._run([
-                self.window_probe, "click", "--repeat", str(self.scroll_down_clicks),
-                "--delay", "15", "5",
-            ], timeout=15)
-        if scroll_up_clicks:
-            self._run([
-                self.window_probe, "click", "--repeat", str(scroll_up_clicks),
-                "--delay", "80", "4",
-            ], timeout=15)
-        time.sleep(0.5)
-        capture = self._run([self.capture_tool, "-window", window_id, str(screenshot)], timeout=15)
-        if capture.returncode != 0 or not screenshot.exists():
+        stamp: str,
+    ) -> CapturedFrame | None:
+        time.sleep(0.35)
+        screenshot = self.capture_dir / (
+            f"receipt-{stamp}-w{window_index}-a{attempt}"
+            f"-up{scroll_up_clicks}.png"
+        )
+        result = self._run(
+            [self.capture_tool, "-window", window_id, str(screenshot)],
+            timeout=self.capture_timeout,
+        )
+        if result.returncode != 0 or not screenshot.exists():
             LOG.warning(
-                "capture_failed regex=%s error=%s",
-                window_regex,
-                capture.stderr[:300],
+                "wechat_capture_failed window=%s attempt=%s scroll_up=%s "
+                "error=%s",
+                window_label,
+                attempt,
+                scroll_up_clicks,
+                result.stderr[:500],
             )
             return None
-        try:
-            ocr = self._run([
-                self.ocr_tool, str(screenshot), "stdout", "-l", self.ocr_language,
-                "--psm", str(self.ocr_psm),
-            ], timeout=30)
-            if ocr.returncode != 0:
-                LOG.warning(
-                    "ocr_failed regex=%s error=%s",
-                    window_regex,
-                    ocr.stderr[:300],
-                )
-                return None
-            ocr_text = ocr.stdout
-            if "微信支付商家助手" in window_regex:
-                latest_clock = self._latest_clock_probe(screenshot)
-                if latest_clock:
-                    ocr_text += (
-                        "\n"
-                        + OCR_LATEST_CLOCK_PREFIX
-                        + latest_clock
-                        + "\n"
-                    )
-            return ocr_text, window_id
-        finally:
-            if not self.keep_screenshots:
-                screenshot.unlink(missing_ok=True)
-            if self.scroll_down_clicks:
-                self._run([
-                    self.window_probe, "click", "--repeat", str(self.scroll_down_clicks),
-                    "--delay", "15", "5",
-                ], timeout=15)
+        LOG.info(
+            "wechat_capture_attempt window=%s attempt=%s scroll_up=%s "
+            "screenshot=%s",
+            window_label,
+            attempt,
+            scroll_up_clicks,
+            screenshot,
+        )
+        return CapturedFrame(
+            window_label,
+            window_id,
+            screenshot,
+            attempt,
+            scroll_up_clicks,
+        )
 
-    def capture_all(self, scroll_up_clicks: int) -> list[tuple[str, str]]:
+    def capture_segments(
+        self,
+    ) -> Iterator[tuple[str, str, str, int, int]]:
+        self.last_capture_successful = False
+        self.last_capture_frames = 0
+        self.last_capture_failure_reason = None
+        self.last_bottom_fingerprint = None
         windows = self.find_windows()
         if not windows:
+            self.last_capture_failure_reason = "window_missing"
             LOG.warning(
                 "collection_window_missing regexes=%s",
                 ",".join(self.window_name_regexes),
             )
-            return []
-        captures: list[tuple[str, str]] = []
-        for index, (regex, window_id) in enumerate(windows, start=1):
-            captured = self._capture_window(
-                window_id=window_id,
-                window_regex=regex,
-                window_index=index,
-                scroll_up_clicks=scroll_up_clicks,
+            return
+
+        stamp = (
+            time.strftime("%Y%m%d-%H%M%S")
+            + f"-{time.time_ns() % 1_000_000:06d}"
+        )
+        captured_frames: list[CapturedFrame] = []
+        scan_had_error = False
+        coverage_complete = True
+        bottom_restored = True
+
+        # Phase 1: capture all overlapping frames while the live UI is stable.
+        for window_index, (window_label, window_id) in enumerate(
+            windows,
+            start=1,
+        ):
+            if not self._prepare_window(window_id):
+                scan_had_error = True
+            window_complete = not self.adaptive_scroll_enabled
+            seen_fingerprints: set[str] = set()
+            try:
+                if self.adaptive_scroll_enabled:
+                    positions = tuple(
+                        index * self.adaptive_scroll_clicks
+                        for index in range(self.adaptive_scroll_max_frames)
+                    )
+                    if not self._return_to_bottom(window_id, window_label):
+                        scan_had_error = True
+                else:
+                    positions = self.scroll_up_attempts
+
+                for attempt, scroll_up_clicks in enumerate(positions, start=1):
+                    if self.adaptive_scroll_enabled:
+                        if attempt > 1 and not self._xdotool(
+                            "click",
+                            "--repeat",
+                            str(self.adaptive_scroll_clicks),
+                            "--delay",
+                            "100",
+                            "4",
+                        ):
+                            scan_had_error = True
+                    else:
+                        if not self._return_to_bottom(window_id, window_label):
+                            scan_had_error = True
+                        if scroll_up_clicks and not self._xdotool(
+                            "click",
+                            "--repeat",
+                            str(scroll_up_clicks),
+                            "--delay",
+                            "100",
+                            "4",
+                        ):
+                            scan_had_error = True
+
+                    frame = self._capture_screenshot(
+                        window_label=window_label,
+                        window_id=window_id,
+                        window_index=window_index,
+                        attempt=attempt,
+                        scroll_up_clicks=scroll_up_clicks,
+                        stamp=stamp,
+                    )
+                    if frame is None:
+                        scan_had_error = True
+                        continue
+                    if (
+                        window_index == 1
+                        and attempt == 1
+                        and scroll_up_clicks == 0
+                    ):
+                        self.last_bottom_fingerprint = (
+                            self._screen_probe_fingerprint_file(
+                                frame.screenshot
+                            )
+                        )
+                    if self.adaptive_scroll_enabled:
+                        fingerprint = self._visual_fingerprint_file(
+                            frame.screenshot
+                        )
+                        if fingerprint and fingerprint in seen_fingerprints:
+                            window_complete = True
+                            LOG.info(
+                                "wechat_adaptive_scroll_complete window=%s "
+                                "attempt=%s scroll_up=%s reason=repeated_frame",
+                                window_label,
+                                attempt,
+                                scroll_up_clicks,
+                            )
+                            frame.screenshot.unlink(missing_ok=True)
+                            break
+                        if fingerprint:
+                            seen_fingerprints.add(fingerprint)
+                    captured_frames.append(frame)
+                else:
+                    if self.adaptive_scroll_enabled:
+                        window_complete = True
+                        LOG.info(
+                            "wechat_adaptive_scroll_complete window=%s "
+                            "frames=%s reason=bounded_max_frames "
+                            "coverage_complete=true",
+                            window_label,
+                            len(positions),
+                        )
+                coverage_complete = coverage_complete and window_complete
+            finally:
+                restored = self._return_to_bottom(window_id, window_label)
+                bottom_restored = bottom_restored and restored
+                if not restored:
+                    scan_had_error = True
+
+        # Phase 2: OCR immutable files after every window is back at the bottom.
+        executor: ThreadPoolExecutor | None = None
+        if self.ocr_workers == 1:
+            processed_frames = map(self._ocr_captured_frame, captured_frames)
+        else:
+            executor = ThreadPoolExecutor(
+                max_workers=self.ocr_workers,
+                thread_name_prefix="wechat-ocr",
             )
-            if captured:
-                captures.append(captured)
-        return captures
+            processed_frames = executor.map(
+                self._ocr_captured_frame,
+                captured_frames,
+            )
+        LOG.info(
+            "wechat_ocr_pool workers=%s frames=%s",
+            self.ocr_workers,
+            len(captured_frames),
+        )
+        try:
+            for result in processed_frames:
+                frame = result.frame
+                if result.error is not None:
+                    scan_had_error = True
+                    LOG.warning(
+                        "wechat_ocr_failed window=%s attempt=%s "
+                        "scroll_up=%s error=%s",
+                        frame.window_label,
+                        frame.attempt,
+                        frame.scroll_up_clicks,
+                        result.error,
+                    )
+                    continue
+                self.last_capture_frames += 1
+                LOG.info(
+                    "wechat_ocr_attempt window=%s attempt=%s scroll_up=%s "
+                    "elapsed_ms=%s screenshot=%s",
+                    frame.window_label,
+                    frame.attempt,
+                    frame.scroll_up_clicks,
+                    result.elapsed_ms,
+                    frame.screenshot,
+                )
+                yield (
+                    result.text or "",
+                    frame.window_id,
+                    str(frame.screenshot),
+                    frame.attempt,
+                    result.elapsed_ms,
+                )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+            if not self.keep_screenshots:
+                for frame in captured_frames:
+                    frame.screenshot.unlink(missing_ok=True)
+
+        self.last_capture_successful = bool(
+            self.last_capture_frames > 0
+            and not scan_had_error
+            and coverage_complete
+            and bottom_restored
+        )
+        if not self.last_capture_successful:
+            if self.last_capture_frames == 0:
+                self.last_capture_failure_reason = "no_ocr_frames"
+            elif scan_had_error:
+                self.last_capture_failure_reason = "capture_error"
+            elif not coverage_complete:
+                self.last_capture_failure_reason = "coverage_incomplete"
+            elif not bottom_restored:
+                self.last_capture_failure_reason = "bottom_restore_failed"
+            LOG.warning(
+                "wechat_scan_incomplete frames=%s coverage_complete=%s "
+                "bottom_restored=%s reason=%s",
+                self.last_capture_frames,
+                coverage_complete,
+                bottom_restored,
+                self.last_capture_failure_reason,
+            )
+
+    def capture_all(self, scroll_up_clicks: int) -> list[tuple[str, str]]:
+        """Compatibility helper for one explicitly selected scroll position."""
+
+        prior_adaptive = self.adaptive_scroll_enabled
+        prior_attempts = self.scroll_up_attempts
+        try:
+            self.adaptive_scroll_enabled = False
+            self.scroll_up_attempts = (max(0, int(scroll_up_clicks)),)
+            return [
+                (text, window_id)
+                for text, window_id, _screenshot, _attempt, _elapsed
+                in self.capture_segments()
+            ]
+        finally:
+            self.adaptive_scroll_enabled = prior_adaptive
+            self.scroll_up_attempts = prior_attempts
 
     def capture(self, scroll_up_clicks: int) -> tuple[str, str] | None:
-        """Compatibility helper returning the first configured window."""
-        captures = self.capture_all(scroll_up_clicks)
-        return captures[0] if captures else None
+        rows = self.capture_all(scroll_up_clicks)
+        return rows[0] if rows else None
 
 
-def attempt_plan(platform: Mapping[str, Any]) -> list[dict[str, float | int]]:
-    raw = platform.get("capture_attempts")
-    if not isinstance(raw, list) or not raw:
-        return [
-            {"delay_seconds": 2.0, "scroll_up_clicks": 0},
-            {"delay_seconds": 5.0, "scroll_up_clicks": 2},
-            {"delay_seconds": 9.0, "scroll_up_clicks": 4},
+def capture_scan_can_clear(
+    capture: LinuxCapture,
+    capture_exception: Exception | None,
+) -> bool:
+    return bool(capture_exception is None and capture.last_capture_successful)
+
+
+def process_capture_segments(
+    *,
+    capture: LinuxCapture,
+    parser: ReceiptParser,
+    trigger_time: int,
+    trigger_signature: str,
+    ignore_freshness: bool,
+) -> Iterator[tuple[PaymentEvent, str]]:
+    texts: list[str] = []
+    emitted_keys: set[str] = set()
+    for text, window_id, screenshot, attempt, _elapsed in capture.capture_segments():
+        texts.append(text)
+        combined = OCR_CAPTURE_SEPARATOR.join(texts)
+        events, reason = parser.parse_all(
+            combined,
+            trigger_time=trigger_time,
+            trigger_signature=trigger_signature,
+            source="wechat-linux-wal-ocr",
+            ignore_freshness=ignore_freshness,
+        )
+        fresh = [
+            (event, receipt_key)
+            for event, receipt_key in events
+            if receipt_key not in emitted_keys
         ]
-    result: list[dict[str, float | int]] = []
-    for row in raw:
-        if not isinstance(row, Mapping):
-            raise ValueError("linux.capture_attempts entries must be objects")
-        result.append({
-            "delay_seconds": max(0.5, float(row.get("delay_seconds", 2))),
-            "scroll_up_clicks": max(0, int(row.get("scroll_up_clicks", 0))),
-        })
-    return sorted(result, key=lambda row: float(row["delay_seconds"]))
+        if fresh:
+            LOG.info(
+                "ocr_batch attempt=%s window=%s candidates=%s screenshot=%s",
+                attempt,
+                window_id,
+                len(fresh),
+                screenshot,
+            )
+            for event, receipt_key in fresh:
+                emitted_keys.add(receipt_key)
+                LOG.info(
+                    "ocr_candidate attempt=%s window=%s amount=%s "
+                    "occurred_at=%s screenshot=%s",
+                    attempt,
+                    window_id,
+                    event.amount,
+                    event.occurred_at,
+                    screenshot,
+                )
+                yield event, receipt_key
+        elif not emitted_keys:
+            LOG.info(
+                "ocr_attempt_miss attempt=%s reason=%s text_sha256=%s",
+                attempt,
+                reason or "pattern_not_found",
+                hashlib.sha256(
+                    normalize_ocr_text(combined).encode("utf-8")
+                ).hexdigest()[:16],
+            )
+
+
+def _combined_change_signature(
+    changed: Sequence[tuple[Path, FileSignature, str]],
+) -> tuple[str, str]:
+    signature = "|".join(
+        f"{path}:{format_file_signature(current)}"
+        for path, current, _reason in changed
+    )
+    reason = (
+        "trigger_file_reappeared"
+        if any(row[2] == "trigger_file_reappeared" for row in changed)
+        else "trigger_file_changed"
+    )
+    return signature, reason
+
+
+def _parser_for_age(
+    config: Mapping[str, Any],
+    max_event_age_seconds: int,
+) -> ReceiptParser:
+    parser_config = config.get("parser", {})
+    if not isinstance(parser_config, Mapping):
+        parser_config = {}
+    return ReceiptParser(
+        {
+            **config,
+            "parser": {
+                **parser_config,
+                "max_event_age_seconds": max_event_age_seconds,
+            },
+        }
+    )
 
 
 def run(config: Mapping[str, Any], once: bool = False) -> int:
     platform = config["linux"]
-    trigger_paths = discover_trigger_files(platform["trigger_files"], config)
+    runtime_config = config.get("runtime", {})
+    if not isinstance(runtime_config, Mapping):
+        runtime_config = {}
+    trigger_patterns = platform["trigger_files"]
+    trigger_paths = discover_trigger_files(trigger_patterns, config)
     signatures = {path: file_signature(path) for path in trigger_paths}
-    parser = ReceiptParser(config)
     capture = LinuxCapture(platform, config)
     runtime = AgentRuntime(config)
-    plan = attempt_plan(platform)
-    poll_seconds = max(0.2, float(config.get("runtime", {}).get("poll_seconds", 0.5)))
-    trigger_quiet_seconds = max(0.0, float(platform.get("trigger_quiet_seconds", 0.8)))
-    active: dict[str, Any] | None = None
-    last_heartbeat = 0.0
-    LOG.info("agent_started platform=linux agent_id=%s triggers=%s restored_pending=%s window=%s",
-             config["agent"]["id"], len(trigger_paths), len(runtime.pending), bool(capture.find_window()))
+
+    LOG.info(
+        "agent_started platform=linux agent_id=%s triggers=%s "
+        "restored_pending=%s window=%s",
+        config["agent"]["id"],
+        len(trigger_paths),
+        len(runtime.pending),
+        bool(capture.find_window()),
+    )
     if once:
         return 0
 
+    trigger_store_value = runtime_config.get("capture_trigger_file")
+    if trigger_store_value:
+        trigger_store_path = resolve_path(str(trigger_store_value), config)
+    else:
+        trigger_store_path = (
+            resolve_path(
+                str(runtime_config.get("spool_dir") or "spool"),
+                config,
+            )
+            / "capture-trigger.json"
+        )
+    trigger_store = CaptureTriggerStore(trigger_store_path)
+    poll_seconds = max(
+        0.2,
+        float(runtime_config.get("poll_seconds", 0.5)),
+    )
+    quiet_seconds = max(
+        0.0,
+        float(platform.get("trigger_quiet_seconds", 0.8)),
+    )
+    legacy_first_delay = float(attempt_plan(platform)[0]["delay_seconds"])
+    render_delay_seconds = max(
+        0.5,
+        float(
+            platform.get(
+                "render_delay_seconds",
+                legacy_first_delay,
+            )
+        ),
+    )
+    max_debounce_seconds = max(
+        quiet_seconds,
+        render_delay_seconds,
+        float(platform.get("max_debounce_seconds", 5.0)),
+    )
+    capture_retry_seconds = max(
+        2.0,
+        float(platform.get("capture_retry_seconds", 15.0)),
+    )
+    parser_config = config.get("parser", {})
+    if not isinstance(parser_config, Mapping):
+        parser_config = {}
+    normal_event_age = max(
+        1,
+        int(parser_config.get("max_event_age_seconds", 180)),
+    )
+    recovery_event_age = max(
+        normal_event_age,
+        int(
+            parser_config.get(
+                "recovery_max_event_age_seconds",
+                600,
+            )
+        ),
+    )
+    screen_probe_interval = max(
+        0.0,
+        float(platform.get("screen_probe_interval_seconds", 15.0)),
+    )
+
+    now_mono = time.monotonic()
+    restored_trigger = trigger_store.load()
+    if restored_trigger is not None:
+        source_reason = restored_trigger.reason
+        restored_trigger = trigger_store.schedule(
+            signature=restored_trigger.signature,
+            trigger_time=restored_trigger.trigger_time,
+            reason="restored_trigger",
+        )
+        LOG.info(
+            "capture_trigger_restored source_reason=%s signature=%s",
+            source_reason,
+            restored_trigger.signature,
+        )
+    elif _as_bool(platform.get("startup_recovery_enabled"), default=True):
+        baseline_text = "|".join(
+            f"{path}:{format_file_signature(signature)}"
+            for path, signature in signatures.items()
+            if signature is not None
+        )
+        restored_trigger = trigger_store.schedule(
+            signature=f"startup:{baseline_text or 'missing'}",
+            trigger_time=int(time.time()),
+            reason="startup_recovery",
+        )
+        LOG.info(
+            "capture_trigger_scheduled reason=startup_recovery signature=%s",
+            restored_trigger.signature,
+        )
+
+    trigger_first_seen = now_mono if restored_trigger is not None else 0.0
+    trigger_due = now_mono + 0.5 if restored_trigger is not None else 0.0
+    last_heartbeat = 0.0
+    last_screen_probe = now_mono
+    last_screen_fingerprint = capture.probe_fingerprint()
+
     while True:
         now_mono = time.monotonic()
-        changed: list[tuple[Path, tuple[int, int]]] = []
-        for path in trigger_paths:
+        discovered = discover_trigger_files(trigger_patterns, config)
+        all_paths = sorted(set(signatures) | set(discovered))
+        changed: list[tuple[Path, FileSignature, str]] = []
+        for path in all_paths:
             current = file_signature(path)
             prior = signatures.get(path)
-            if prior is not None and current is not None and current != prior:
-                changed.append((path, current))
+            change = trigger_file_change(prior, current)
+            if change is not None:
+                _signature_text, reason = change
+                assert current is not None
+                changed.append((path, current, reason))
             signatures[path] = current
-        if changed:
-            wall = int(time.time())
-            joined = "|".join(f"{path}:{sig[0]}:{sig[1]}" for path, sig in changed)
-            if active is None:
-                active = {
-                    "wall": wall,
-                    "signature": joined,
-                    "index": 0,
-                    "started": now_mono,
-                    "not_before": now_mono + trigger_quiet_seconds,
-                    "texts": [],
-                    "emitted_keys": set(),
-                    "candidate_count": 0,
-                }
-            else:
-                active["wall"] = wall
-                active["signature"] = f"{active['signature']}|{joined}"
-                active["not_before"] = now_mono + trigger_quiet_seconds
-            LOG.info("ocr_trigger files=%s", ",".join(str(path) for path, _ in changed))
 
-        if active:
-            index = int(active["index"])
-            row = plan[index]
-            due = max(
-                float(active["started"]) + float(row["delay_seconds"]),
-                float(active["not_before"]),
+        if changed:
+            signature_text, reason = _combined_change_signature(changed)
+            if trigger_store.load() is None:
+                trigger_first_seen = now_mono
+            trigger_store.schedule(
+                signature=signature_text,
+                trigger_time=int(time.time()),
+                reason=reason,
             )
-            if now_mono >= due:
-                attempt_started = time.monotonic()
-                captured_rows = capture.capture_all(
-                    int(row["scroll_up_clicks"])
+            trigger_due = max(
+                trigger_first_seen + render_delay_seconds,
+                min(
+                    now_mono + quiet_seconds,
+                    trigger_first_seen + max_debounce_seconds,
+                ),
+            )
+            LOG.info(
+                "capture_trigger_scheduled reason=%s files=%s",
+                reason,
+                ",".join(str(path) for path, _current, _reason in changed),
+            )
+
+        active_trigger = trigger_store.load()
+        if active_trigger is not None and now_mono >= trigger_due:
+            started = time.monotonic()
+            capture_exception: Exception | None = None
+            recovery_reasons = {
+                "startup_recovery",
+                "restored_trigger",
+                "window_recovered",
+            }
+            max_event_age = (
+                recovery_event_age
+                if active_trigger.reason in recovery_reasons
+                else normal_event_age
+            )
+            candidates: list[tuple[PaymentEvent, str]] = []
+            try:
+                parser = _parser_for_age(config, max_event_age)
+                candidates = list(
+                    process_capture_segments(
+                        capture=capture,
+                        parser=parser,
+                        trigger_time=active_trigger.trigger_time,
+                        trigger_signature=active_trigger.signature,
+                        ignore_freshness=False,
+                    )
                 )
-                reason = "capture_failed"
-                for text, window_id in captured_rows:
-                    active["texts"].append(text)
-                    events, reason = parser.parse_all(
-                        OCR_CAPTURE_SEPARATOR.join(active["texts"]),
-                        trigger_time=int(active["wall"]),
-                        trigger_signature=str(active["signature"]),
-                        source="wechat-linux-wal-ocr",
+            except Exception as exc:
+                capture_exception = exc
+                LOG.exception(
+                    "capture_cycle_failed reason=%s",
+                    active_trigger.reason,
+                )
+            finally:
+                capture.prune_capture_screenshots()
+
+            queued_ids: list[str] = []
+            for event, receipt_key in candidates:
+                if runtime.queue(event, receipt_key):
+                    queued_ids.append(event.event_id)
+
+            scan_successful = capture_scan_can_clear(
+                capture,
+                capture_exception,
+            )
+            if scan_successful:
+                trigger_store.clear(active_trigger.signature)
+                trigger_due = 0.0
+                trigger_first_seen = 0.0
+                refreshed = capture.probe_fingerprint()
+                if refreshed:
+                    if (
+                        capture.last_bottom_fingerprint is not None
+                        and not capture.screen_fingerprints_equal(
+                            refreshed,
+                            capture.last_bottom_fingerprint,
+                        )
+                    ):
+                        followup = trigger_store.schedule(
+                            signature=f"screen:{refreshed[:32]}",
+                            trigger_time=int(time.time()),
+                            reason="post_capture_screen_changed",
+                        )
+                        trigger_first_seen = time.monotonic()
+                        trigger_due = trigger_first_seen + 0.5
+                        LOG.info(
+                            "capture_trigger_scheduled reason=%s signature=%s",
+                            followup.reason,
+                            followup.signature,
+                        )
+                    last_screen_fingerprint = refreshed
+                last_screen_probe = time.monotonic()
+            else:
+                trigger_due = time.monotonic() + capture_retry_seconds
+                LOG.warning(
+                    "capture_trigger_retained reason=%s signature=%s "
+                    "retry_seconds=%s scan_reason=%s",
+                    active_trigger.reason,
+                    active_trigger.signature,
+                    int(capture_retry_seconds),
+                    capture.last_capture_failure_reason
+                    or (
+                        type(capture_exception).__name__
+                        if capture_exception is not None
+                        else "incomplete"
+                    ),
+                )
+
+            # Network delivery starts after the UI is restored and the entire
+            # candidate batch is persisted locally.
+            runtime.deliver_ids(queued_ids, time.monotonic())
+            LOG.info(
+                "ocr_cycle_complete reason=%s candidates=%s "
+                "scan_successful=%s elapsed_ms=%s",
+                active_trigger.reason,
+                len(candidates),
+                scan_successful,
+                int((time.monotonic() - started) * 1000),
+            )
+
+        now_mono = time.monotonic()
+        if (
+            screen_probe_interval > 0
+            and trigger_store.load() is None
+            and now_mono - last_screen_probe >= screen_probe_interval
+        ):
+            last_screen_probe = now_mono
+            fingerprint = capture.probe_fingerprint()
+            if fingerprint:
+                reason: str | None = None
+                if last_screen_fingerprint is None:
+                    reason = "window_recovered"
+                elif not capture.screen_fingerprints_equal(
+                    fingerprint,
+                    last_screen_fingerprint,
+                ):
+                    reason = "periodic_screen_changed"
+                if reason is not None:
+                    trigger = trigger_store.schedule(
+                        signature=f"screen:{fingerprint[:32]}",
+                        trigger_time=int(time.time()),
+                        reason=reason,
                     )
-                    fresh = [
-                        (event, receipt_key)
-                        for event, receipt_key in events
-                        if receipt_key not in active["emitted_keys"]
-                    ]
-                    if fresh:
-                        LOG.info(
-                            "ocr_batch attempt=%s window=%s candidates=%s elapsed_ms=%s",
-                            index + 1,
-                            window_id,
-                            len(fresh),
-                            int((time.monotonic() - attempt_started) * 1000),
-                        )
-                        queued: list[str] = []
-                        for event, receipt_key in fresh:
-                            active["emitted_keys"].add(receipt_key)
-                            active["candidate_count"] += 1
-                            LOG.info(
-                                "ocr_candidate attempt=%s window=%s amount=%s occurred_at=%s",
-                                index + 1,
-                                window_id,
-                                event.amount,
-                                event.occurred_at,
-                            )
-                            if runtime.queue(event, receipt_key):
-                                queued.append(event.event_id)
-                        # Post newly recognized receipts before requesting the
-                        # next fallback scroll position. Older retries are
-                        # handled only after the active OCR work.
-                        runtime.deliver_ids(queued, time.monotonic())
-                    else:
-                        LOG.info(
-                            "ocr_attempt_miss attempt=%s reason=%s text_sha256=%s",
-                            index + 1,
-                            reason or "pattern_not_found",
-                            hashlib.sha256(normalize_ocr_text(text).encode()).hexdigest()[:16],
-                        )
-                index += 1
-                if index >= len(plan):
+                    trigger_first_seen = now_mono
+                    trigger_due = now_mono + 0.5
                     LOG.info(
-                        "ocr_cycle_complete candidates=%s elapsed_ms=%s last_reason=%s",
-                        active["candidate_count"],
-                        int((time.monotonic() - float(active["started"])) * 1000),
+                        "capture_trigger_scheduled reason=%s signature=%s",
                         reason,
+                        trigger.signature,
                     )
-                    active = None
-                else:
-                    active["index"] = index
+                last_screen_fingerprint = fingerprint
 
         now_mono = time.monotonic()
         runtime.deliver_due(now_mono)
         if now_mono - last_heartbeat >= 60:
-            LOG.info("heartbeat platform=linux window=%s pending=%s", bool(capture.find_window()), len(runtime.pending))
+            LOG.info(
+                "heartbeat platform=linux window=%s pending=%s "
+                "capture_pending=%s",
+                bool(capture.find_window()),
+                len(runtime.pending),
+                trigger_store.load() is not None,
+            )
             last_heartbeat = now_mono
         time.sleep(poll_seconds)
 
@@ -411,7 +1462,11 @@ def run(config: Mapping[str, Any], once: bool = False) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     cli = argparse.ArgumentParser(description="Linux WeChat payment receiver")
     cli.add_argument("--config", required=True)
-    cli.add_argument("--once", action="store_true")
+    cli.add_argument(
+        "--once",
+        action="store_true",
+        help="validate configuration and probe the window, then exit",
+    )
     cli.add_argument("--verbose", action="store_true")
     args = cli.parse_args(argv)
     config = load_json(args.config)

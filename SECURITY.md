@@ -5,7 +5,9 @@
 - No production URL, token, account identifier, chat history, payment record or personal path is included.
 - The shared secret is read from `WECHAT_RECEIVER_TOKEN`; inline secrets are rejected by default.
 - HTTPS is required. Plain HTTP is accepted only for an explicitly enabled loopback address.
-- Existing trigger files form a baseline; startup does not replay historical receipts.
+- Startup recovery is freshness-bounded and receipt keys remain durably deduplicated.
+- A durable single-slot capture trigger is cleared only after a complete scan.
+- The periodic screen probe stores only a short perceptual fingerprint, not OCR text.
 - A receipt needs an explicit timestamp close to the WAL trigger time.
 - Full OCR text and screenshots are discarded by default.
 - The sample webhook receiver binds to `127.0.0.1` by default and verifies timestamped HMAC signatures.

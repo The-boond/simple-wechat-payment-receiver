@@ -10,6 +10,7 @@ Group=YOUR_USER
 WorkingDirectory=/opt/simple-wechat-payment-receiver
 EnvironmentFile=/etc/simple-wechat-payment-receiver.env
 Environment=DISPLAY=:88
+Environment=OMP_THREAD_LIMIT=1
 ExecStart=/usr/bin/python3 /opt/simple-wechat-payment-receiver/linux_agent.py --config /opt/simple-wechat-payment-receiver/config.json
 Restart=always
 RestartSec=5
@@ -21,8 +22,7 @@ ProtectHome=read-only
 ReadWritePaths=/opt/simple-wechat-payment-receiver/spool /opt/simple-wechat-payment-receiver/captures
 MemoryHigh=180M
 MemoryMax=300M
-CPUQuota=80%
+CPUQuota=180%
 
 [Install]
 WantedBy=multi-user.target
-

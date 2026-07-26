@@ -18,7 +18,7 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 
@@ -52,6 +52,53 @@ class PaymentEvent:
 
     def payload(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class CaptureTrigger:
+    """One durable request to scan the payment conversation."""
+
+    signature: str
+    trigger_time: int
+    reason: str
+    scheduled_at: int
+
+
+@dataclass(frozen=True)
+class VisualToken:
+    """A word-level Tesseract TSV result with screen coordinates."""
+
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    confidence: float
+
+    @property
+    def center_y(self) -> float:
+        return self.top + (self.height / 2.0)
+
+
+@dataclass(frozen=True)
+class VisualAmount:
+    amount: str
+    center_y: float
+    confidence: float
+
+
+@dataclass(frozen=True)
+class VisualClock:
+    clock: str
+    center_y: float
+    confidence: float
+
+
+@dataclass(frozen=True)
+class MerchantTextReceipt:
+    clock: str
+    amount: str
+    raw_text: str
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
@@ -142,6 +189,293 @@ def canonical_money(value: str) -> str:
     return f"{cents // 100}.{cents % 100:02d}"
 
 
+def parse_tesseract_tsv(value: str) -> list[VisualToken]:
+    """Parse Tesseract TSV without optional image/data-frame dependencies."""
+
+    rows = value.splitlines()
+    if not rows:
+        return []
+    header = rows[0].split("\t")
+    indexes = {name: index for index, name in enumerate(header)}
+    required = {"left", "top", "width", "height", "conf", "text"}
+    if not required.issubset(indexes):
+        return []
+    result: list[VisualToken] = []
+    for row in rows[1:]:
+        columns = row.split("\t")
+        if len(columns) < len(header):
+            columns.extend([""] * (len(header) - len(columns)))
+        try:
+            text = columns[indexes["text"]].strip()
+            if not text:
+                continue
+            result.append(
+                VisualToken(
+                    text=text,
+                    left=int(columns[indexes["left"]]),
+                    top=int(columns[indexes["top"]]),
+                    width=int(columns[indexes["width"]]),
+                    height=int(columns[indexes["height"]]),
+                    confidence=float(columns[indexes["conf"]]),
+                )
+            )
+        except (IndexError, ValueError):
+            continue
+    return result
+
+
+def visual_amount_from_token(token: VisualToken) -> VisualAmount | None:
+    compact = normalize_ocr_text(token.text)
+    match = re.fullmatch(
+        r"(?P<currency>[￥¥YV])?(?P<amount>[0-9Oo]{1,8}[.][0-9Oo]{2})",
+        compact,
+    )
+    if not match or token.height < 20:
+        return None
+    # A currency-less decimal may belong to another service card. Require
+    # stronger OCR confidence when there is no currency-shaped prefix.
+    minimum_confidence = 35 if match.group("currency") else 60
+    if token.confidence < minimum_confidence:
+        return None
+    try:
+        amount = canonical_money(match.group("amount"))
+    except ValueError:
+        return None
+    return VisualAmount(amount, token.center_y, token.confidence)
+
+
+def visual_clock_from_token(
+    token: VisualToken,
+    *,
+    resize_factor: float = 1.0,
+) -> VisualClock | None:
+    compact = normalize_ocr_text(token.text)
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", compact)
+    if not match or token.confidence < 25:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    factor = resize_factor if resize_factor > 0 else 1.0
+    return VisualClock(
+        clock=f"{hour:02d}:{minute:02d}",
+        center_y=token.center_y / factor,
+        confidence=token.confidence,
+    )
+
+
+def associate_visual_receipts(
+    amounts: Sequence[VisualAmount],
+    clocks: Sequence[VisualClock],
+    *,
+    min_gap: float = 35.0,
+    max_gap: float = 640.0,
+) -> list[tuple[VisualClock, VisualAmount]]:
+    """Pair each amount with the nearest preceding chat-group clock.
+
+    WeChat may print one clock above a burst and omit it on the following
+    cards. Reusing the nearest preceding clock preserves every locally
+    confirmed receipt in that group, while a clipped top card with no visible
+    preceding clock is left for an overlapping frame.
+    """
+
+    ordered_clocks = sorted(clocks, key=lambda item: item.center_y)
+    pairs: list[tuple[VisualClock, VisualAmount]] = []
+    for amount in sorted(amounts, key=lambda item: item.center_y):
+        eligible = [
+            clock
+            for clock in ordered_clocks
+            if min_gap <= amount.center_y - clock.center_y <= max_gap
+        ]
+        if eligible:
+            pairs.append((max(eligible, key=lambda item: item.center_y), amount))
+    return pairs
+
+
+def merchant_text_receipts(
+    text: str,
+    *,
+    fallback_clock: str | None = None,
+) -> list[MerchantTextReceipt]:
+    """Extract bounded merchant cards and never borrow the next card's amount."""
+
+    normalized = normalize_ocr_text(text)
+    headers = list(re.finditer(r"收款通知", normalized))
+    if not headers:
+        return []
+
+    embedded_fallback = re.search(
+        rf"{re.escape(OCR_LATEST_CLOCK_PREFIX)}"
+        r"(?P<hour>\d{1,2}):(?P<minute>\d{2})",
+        normalized,
+    )
+    if fallback_clock is None and embedded_fallback:
+        fallback_clock = (
+            f"{int(embedded_fallback.group('hour')):02d}:"
+            f"{int(embedded_fallback.group('minute')):02d}"
+        )
+    if fallback_clock is not None:
+        fallback_match = re.fullmatch(r"(\d{1,2}):(\d{2})", fallback_clock)
+        if fallback_match is None or not (
+            0 <= int(fallback_match.group(1)) <= 23
+            and 0 <= int(fallback_match.group(2)) <= 59
+        ):
+            fallback_clock = None
+        else:
+            fallback_clock = (
+                f"{int(fallback_match.group(1)):02d}:"
+                f"{int(fallback_match.group(2)):02d}"
+            )
+
+    clock_re = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)")
+    labelled_amount_re = re.compile(
+        r"收款金额.{0,32}?[￥¥YV]?"
+        r"(?P<amount>[0-9Oo]{1,8}[.][0-9Oo]{1,2})"
+    )
+    currency_amount_re = re.compile(
+        r"[￥¥YV](?P<amount>[0-9Oo]{1,8}[.][0-9Oo]{1,2})"
+    )
+    receipts: list[MerchantTextReceipt] = []
+    group_clock: str | None = None
+    for index, header in enumerate(headers):
+        card_end = (
+            headers[index + 1].start()
+            if index + 1 < len(headers)
+            else len(normalized)
+        )
+        prefix_start = max(0, header.start() - 160)
+        if index:
+            prefix_start = max(prefix_start, headers[index - 1].end())
+        clock: str | None = None
+        for clock_match in clock_re.finditer(
+            normalized[prefix_start : header.start()]
+        ):
+            hour = int(clock_match.group(1))
+            minute = int(clock_match.group(2))
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                clock = f"{hour:02d}:{minute:02d}"
+        if clock is not None:
+            group_clock = clock
+        elif group_clock is not None:
+            # A service-account group may show one clock above several cards.
+            clock = group_clock
+        elif index == len(headers) - 1:
+            clock = fallback_clock
+        if clock is None:
+            continue
+
+        card_body = normalized[header.end() : card_end][:260]
+        amount_match = labelled_amount_re.search(card_body)
+        if amount_match is None:
+            amount_match = currency_amount_re.search(card_body)
+        if amount_match is None:
+            continue
+        try:
+            amount = canonical_money(amount_match.group("amount"))
+        except ValueError:
+            continue
+        receipts.append(
+            MerchantTextReceipt(
+                clock=clock,
+                amount=amount,
+                raw_text=normalized[header.start() : card_end],
+            )
+        )
+    return receipts
+
+
+def _amount_cents(value: str) -> int:
+    yuan, fraction = value.split(".", 1)
+    return int(yuan) * 100 + int(fraction)
+
+
+def merchant_parser_text(
+    full_ocr_text: str,
+    visual_pairs: Sequence[tuple[VisualClock, VisualAmount]],
+    probe_clocks: Sequence[VisualClock],
+    *,
+    allow_clock_fallback: bool = True,
+) -> str:
+    """Merge coordinate evidence card-by-card and suppress OCR conflicts."""
+
+    latest_clock = (
+        probe_clocks[-1].clock
+        if allow_clock_fallback and probe_clocks
+        else None
+    )
+    if not visual_pairs:
+        text = full_ocr_text
+        if latest_clock:
+            text += "\n" + OCR_LATEST_CLOCK_PREFIX + latest_clock + "\n"
+        return text
+
+    merged = merchant_text_receipts(
+        full_ocr_text,
+        fallback_clock=latest_clock,
+    )
+    matched_full_indexes: set[int] = set()
+    for clock, amount in sorted(visual_pairs, key=lambda pair: pair[1].center_y):
+        unmatched_exact_amount = [
+            index
+            for index, receipt in enumerate(merged)
+            if index not in matched_full_indexes and receipt.amount == amount.amount
+        ]
+        same_clock = [
+            index
+            for index, receipt in enumerate(merged)
+            if index not in matched_full_indexes and receipt.clock == clock.clock
+        ]
+        exact = [
+            index
+            for index in same_clock
+            if merged[index].amount == amount.amount
+        ]
+        matched_index: int | None = None
+        if exact:
+            matched_index = exact[0]
+        elif len(unmatched_exact_amount) == 1:
+            # Coordinate evidence may restore a clock that full OCR attached to
+            # the wrong card. Re-clock a unique exact amount only.
+            matched_index = unmatched_exact_amount[0]
+        elif same_clock:
+            # Replace only the closest same-clock amount; unrelated cards stay.
+            matched_index = min(
+                same_clock,
+                key=lambda index: abs(
+                    _amount_cents(merged[index].amount)
+                    - _amount_cents(amount.amount)
+                ),
+            )
+        if matched_index is None:
+            merged.append(
+                MerchantTextReceipt(clock.clock, amount.amount, "visual")
+            )
+            matched_full_indexes.add(len(merged) - 1)
+        else:
+            merged[matched_index] = MerchantTextReceipt(
+                clock.clock,
+                amount.amount,
+                "visual",
+            )
+            matched_full_indexes.add(matched_index)
+
+    lines: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for receipt in merged:
+        key = (receipt.clock, receipt.amount)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"{receipt.clock} 收款通知 ¥{receipt.amount}")
+    # Keep a non-digit boundary after whitespace normalization, otherwise one
+    # amount's cents can hide the next card's clock.
+    text = "\n<WECHAT_MERCHANT_CARD>\n".join(lines)
+    if latest_clock:
+        text += "\n" + OCR_LATEST_CLOCK_PREFIX + latest_clock + "\n"
+    return text
+
+
 class ReceiptParser:
     def __init__(self, config: Mapping[str, Any]):
         parser = config.get("parser", {})
@@ -203,59 +537,20 @@ class ReceiptParser:
             except (ValueError, OverflowError):
                 continue
 
-        # Merchant QR receipts arrive in the "微信支付商家助手" service-account
-        # conversation. Its card exposes a chat clock (HH:MM), "收款通知", and
-        # the amount, but not the dated "经营码收款到账通知" header.
-        merchant_receipt_re = re.compile(
-            r"收款通知.{0,220}?"
-            r"(?:收款金额)?[￥¥YV]?"
-            r"(?P<amount>[0-9Oo]+[.．。][0-9Oo]{1,2})",
-            re.IGNORECASE,
-        )
-        merchant_clock_re = re.compile(
-            r"(?<!\d)(?P<hour>\d{1,2}):(?P<minute>\d{2})(?!\d)"
-        )
         # Keep OCR scroll captures independent so a clock from one screenshot
         # is never joined to a receipt card in the next screenshot.
         for segment in text.split(OCR_CAPTURE_SEPARATOR):
-            normalized_segment = normalize_ocr_text(segment)
-            merchant_matches = list(
-                merchant_receipt_re.finditer(normalized_segment)
-            )
-            latest_clock_match = re.search(
-                rf"{re.escape(OCR_LATEST_CLOCK_PREFIX)}"
-                r"(?P<hour>\d{1,2}):(?P<minute>\d{2})",
-                normalized_segment,
-            )
-            for match_index, receipt in enumerate(merchant_matches):
-                prefix = normalized_segment[
-                    max(0, receipt.start() - 320) : receipt.start()
-                ]
-                clocks = list(merchant_clock_re.finditer(prefix))
-                if clocks:
-                    hour = int(clocks[-1].group("hour"))
-                    minute = int(clocks[-1].group("minute"))
-                elif (
-                    latest_clock_match
-                    and match_index == len(merchant_matches) - 1
-                ):
-                    # The pale chat clock can disappear from full-window OCR.
-                    # A contrast-enhanced center-strip probe supplies the
-                    # newest visible clock. Bind it only to the newest receipt
-                    # so older cards are never replayed as new.
-                    hour = int(latest_clock_match.group("hour"))
-                    minute = int(latest_clock_match.group("minute"))
-                else:
-                    continue
+            for receipt in merchant_text_receipts(segment):
+                hour_text, minute_text = receipt.clock.split(":", 1)
                 try:
                     candidates.append(
                         (
                             self._clock_timestamp(
-                                hour,
-                                minute,
+                                int(hour_text),
+                                int(minute_text),
                                 trigger_time,
                             ),
-                            canonical_money(receipt.group("amount")),
+                            canonical_money(receipt.amount),
                         )
                     )
                 except (ValueError, OverflowError):
@@ -360,6 +655,57 @@ class ReceiptParser:
         return min(events, key=lambda row: abs(trigger_time - row[0].occurred_at))
 
 
+class CaptureTriggerStore:
+    """Single-slot durable trigger that survives an agent process restart."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path).expanduser().resolve()
+
+    def load(self) -> CaptureTrigger | None:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            return CaptureTrigger(
+                signature=str(value["signature"]),
+                trigger_time=int(value["trigger_time"]),
+                reason=str(value["reason"]),
+                scheduled_at=int(value["scheduled_at"]),
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            LOG.error("invalid_capture_trigger file=%s error=%s", self.path, exc)
+            return None
+
+    def schedule(
+        self,
+        *,
+        signature: str,
+        trigger_time: int,
+        reason: str,
+    ) -> CaptureTrigger:
+        trigger = CaptureTrigger(
+            signature=str(signature),
+            trigger_time=int(trigger_time),
+            reason=str(reason),
+            scheduled_at=int(time.time()),
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(asdict(trigger), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.path)
+        return trigger
+
+    def clear(self, expected_signature: str | None = None) -> None:
+        if expected_signature is not None:
+            current = self.load()
+            if current and current.signature != expected_signature:
+                return
+        self.path.unlink(missing_ok=True)
+
+
 class EventSpool:
     def __init__(self, root: Path):
         self.root = root
@@ -440,7 +786,10 @@ class BridgeClient:
         self.url = str(bridge["url"])
         self.token = secret_from_config(config)
         self.timeout = float(bridge.get("timeout_seconds", 10))
-        self.user_agent = str(bridge.get("user_agent") or "Simple-WeChat-Payment-Receiver/1.0")
+        self.user_agent = str(
+            bridge.get("user_agent")
+            or "Simple-WeChat-Payment-Receiver/1.2"
+        )
 
     def send(self, event: PaymentEvent) -> dict[str, Any]:
         data = json.dumps(event.payload(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -460,7 +809,22 @@ class BridgeClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = response.read().decode("utf-8", "replace")
-                payload = json.loads(body) if body else {}
+                try:
+                    payload = json.loads(body) if body else {}
+                except json.JSONDecodeError:
+                    return {
+                        "ok": False,
+                        "http_status": response.status,
+                        "reason": "invalid_bridge_response",
+                        "message": body[:300],
+                    }
+                if not isinstance(payload, dict):
+                    return {
+                        "ok": False,
+                        "http_status": response.status,
+                        "reason": "invalid_bridge_response",
+                        "message": "response JSON root is not an object",
+                    }
                 payload.setdefault("http_status", response.status)
                 return payload
         except urllib.error.HTTPError as exc:
@@ -556,12 +920,31 @@ class AgentRuntime:
             self._deliver_one(event_id, now_mono)
 
 
-def file_signature(path: Path) -> tuple[int, int] | None:
+FileSignature = tuple[int, int, int, int]
+
+
+def file_signature(path: Path) -> FileSignature | None:
     try:
         stat = path.stat()
-        return stat.st_mtime_ns, stat.st_size
+        return stat.st_ino, stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size
     except OSError:
         return None
+
+
+def format_file_signature(signature: FileSignature) -> str:
+    return ":".join(str(value) for value in signature)
+
+
+def trigger_file_change(
+    previous: FileSignature | None,
+    current: FileSignature | None,
+) -> tuple[str, str] | None:
+    """Describe a trigger-file change, including missing-to-present."""
+
+    if current is None or current == previous:
+        return None
+    reason = "trigger_file_reappeared" if previous is None else "trigger_file_changed"
+    return format_file_signature(current), reason
 
 
 def setup_logging(config: Mapping[str, Any], verbose: bool = False) -> None:

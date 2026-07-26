@@ -1,6 +1,6 @@
 # 简陋的微信收款接收器
 
-一个可自行配置的 Linux 微信桌面收款消息采集器。它监听微信业务消息数据库的 WAL 变化，仅在新变化发生后截图并 OCR“微信收款助手”中的最新收款卡片，然后把标准化事件通过带时间戳的 HMAC 请求发送到你的业务接口。
+一个可自行配置的 Linux 微信桌面收款消息采集器。它以微信业务消息数据库的 WAL 变化作为低延迟触发，以持久触发记录和轻量画面探针补漏，批量截图并 OCR 收款会话中的最新卡片，然后把标准化事件通过带时间戳的 HMAC 请求发送到你的业务接口。
 
 > 这不是微信支付官方商户 API。软件采集模式需要一台持续登录微信 Linux 桌面客户端的设备。生产订单的匹配、完成、退款和金额校验仍应由你的服务端实现。
 
@@ -14,11 +14,13 @@
 
 ## 功能
 
-- Linux：业务消息 WAL 触发 + X11 截图 + Tesseract OCR。
-- 启动只建立基线，不重放历史收款记录。
+- Linux：业务消息 WAL 触发 + X11 重叠截图 + Tesseract OCR。
+- WAL 触发先原子写入磁盘；进程重启后继续未完成的截图周期。
+- 启动补扫和 15 秒轻量画面探针可补上停机窗口、WAL 重建或偶发漏触发。
 - 明确金额、月日和时分必须接近 WAL 触发时间。
-- 第一轮 OCR 识别后立即上报，后续滚动位置继续补扫。
+- 先快速截完全部滚动位置并回到底部，再做 OCR 和网络上报，减少突发到账期间的截屏空窗。
 - 单次 OCR 周期可提取多张到账卡片，适应短时间连续付款。
+- 商家助手使用坐标化时钟/金额证据、逐卡边界和局部二次确认，抑制金额数字冲突。
 - HMAC-SHA256 签名、事件 ID、持久 spool、指数退避和幂等重试。
 - 过期 `no_candidate` 自动进入 rejected 归档，不会无限占用重试队列。
 - 默认不保存完整 OCR 文本或截图。
@@ -90,6 +92,9 @@ X-Bridge-Signature: HMAC_SHA256(secret, timestamp + "." + raw_json_body)
 cp configs/linux.example.json config.json
 ```
 
+所有相对目录都以最终 `config.json` 所在目录为基准；示例先复制到项目根目录，
+对应 systemd unit 中可写的 `spool/` 和 `captures/`。
+
 必须修改：
 
 | 配置 | 说明 |
@@ -109,11 +114,15 @@ cp configs/linux.example.json config.json
 - `parser.max_event_age_seconds`
 - `runtime.poll_seconds`
 - `runtime.spool_dir`
+- `runtime.capture_trigger_file`：未完成截图周期的单槽持久记录
 - `runtime.no_candidate_max_age_seconds`：无候选事件的最长保留时间，默认 2100 秒
 - `runtime.retry_max_age_seconds`：传输失败事件的最长保留时间，默认 86400 秒
 - `trigger_quiet_seconds`：WAL 最后一次变化后的静默等待，避免文件仍在写入时过早 OCR
-- `capture_attempts` 的延迟和滚动位置
-- OCR 命令、语言、PSM、截图保留策略
+- `render_delay_seconds`：从首个 WAL 变化起至少等待多久再截首帧，默认兼容旧计划的 2 秒
+- `max_debounce_seconds`：连续 WAL 写入时的最长合并等待，避免高峰期一直推迟
+- `adaptive_scroll_*`：从底部开始的重叠帧步长和单周期最大帧数
+- `screen_probe_interval_seconds`：WAL 空闲时的轻量画面变化探针；设为 `0` 可关闭
+- OCR 命令、语言、PSM、受控超时和截图保留策略
 
 `window_name_regexes` 可同时配置多个窗口；旧版单值
 `window_name_regex` 仍兼容。内置解析器同时支持：
@@ -121,9 +130,12 @@ cp configs/linux.example.json config.json
 - `微信收款助手` 的“经营码收款到账通知 + 完整日期时间”卡片。
 - `微信支付商家助手` 的“HH:MM + 收款通知 + 金额”卡片。
 
-针对商家助手卡片中对比度较低的浅灰色时间，Linux Agent 会额外对聊天
-中轴区域做放大、灰度和阈值 OCR；补出的时间只绑定到画面中最新的一张
-收款卡片，避免把旧卡片重复上报。
+针对商家助手卡片中对比度较低的浅灰色时间，Linux Agent 会对聊天中轴
+区域做多阈值放大 OCR，并保留单词纵坐标。每个大号金额与最近的前置聊天
+分组时钟配对；同一分组的后续卡片可复用时钟，顶部被截断且缺少前置时钟
+的卡片留给下一张重叠截图。每个配对还会在本卡片范围内做中文 OCR 确认。
+当全窗口 OCR 把 `41.23` 误读成 `41.28` 时，坐标证据只替换对应
+卡片，不覆盖其他未被视觉通道覆盖的收款记录。
 
 ## 共享密钥
 
@@ -171,7 +183,15 @@ python3 linux_agent.py --config config.json
 
 ### 连续多笔付款
 
-每次截图后，Agent 会解析当前累计 OCR 文本中的全部新到账卡片。识别出的事件会先写入持久 spool，并在下一张补扫截图前立即发送；相邻滚动位置重复出现的同一张卡片会被去重。
+每次触发后，Agent 先从会话底部按配置的重叠步长快速截图，遇到重复画面或达到有界帧数后回到底部；随后按截图顺序 OCR。这样 OCR 或接口响应变慢时，微信窗口也不会长时间停在历史位置。全部候选先写入持久 spool，完整截图周期结束后再发送；相邻滚动位置重复出现的同一张卡片会被去重。
+
+`ocr_workers` 默认并保持为 `1`。只有在目标主机上用自有测试帧验证 CPU、
+内存和单帧耗时都留有余量时，再尝试设为 `2`；实现会把并发硬限制在 2，
+并始终按截图顺序消费结果。示例 systemd unit 使用
+`OMP_THREAD_LIMIT=1`，并为双 worker 预留接近两个 CPU 核的 quota；若沿用
+较低的 CPU quota，请继续使用单 worker。
+
+截图触发也单独持久化。只有完整覆盖、OCR 成功且窗口回到底部后才清除；截图或 OCR 超时、窗口暂时消失时会保留并在 `capture_retry_seconds` 后重试。启动补扫使用 `parser.recovery_max_event_age_seconds` 的较长时间窗，日常 WAL/画面触发继续使用 `max_event_age_seconds`，持久去重会压住已经处理过的卡片。
 
 微信到账卡片通常只显示到分钟。接收端如果可能同时存在多笔同价订单，应给收银台金额分配不同的分币尾数，并要求付款人严格支付页面显示的完整金额。例如同为 `¥100.00` 的订单可依次显示为 `¥100.00`、`¥100.01`、`¥100.02`。尾数分配必须使用数据库事务或唯一约束。
 
@@ -224,7 +244,11 @@ python -m py_compile receiver_core.py linux_agent.py examples/webhook_receiver.p
 
 ### 有 trigger，没有 candidate
 
-调整 `capture_attempts`、窗口标题、OCR 语言或 `receipt_pattern`。Linux 可按 `0/2/4` 的滚动位置重试。
+检查窗口标题、OCR 语言、视觉依赖和 `receipt_pattern`。优先调整 `adaptive_scroll_clicks`、`adaptive_scroll_max_frames` 和 `clock_probe_thresholds`；旧配置中的 `capture_attempts` 在关闭自适应滚动后仍兼容。
+
+### capture_pending 持续存在
+
+查看日志中的 `scan_reason`。`window_missing`、`no_ocr_frames`、`capture_error` 或 `bottom_restore_failed` 都会保留持久触发，修复窗口、命令超时或 DISPLAY 后会自动补扫。`capture-trigger.json` 不应由外部任务直接删除。
 
 ### pending 持续增加
 
