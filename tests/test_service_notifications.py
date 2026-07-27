@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -63,6 +64,46 @@ class ServiceNotificationParserTests(unittest.TestCase):
             "4200000000000000000000000001",
             receipts[0].external_txn_id,
         )
+
+    def test_multipass_ocr_uses_unique_majority_for_digit_reversal(self) -> None:
+        transaction_id = "4200000000000000000000000099"
+        template = (
+            "微信收款商业版 收款通知 01月15日 10:11:12 "
+            "收款金额 ¥{amount} 订单金额 ¥{amount} "
+            f"交易单号 {transaction_id}"
+        )
+        text = linux_agent.OCR_CAPTURE_SEPARATOR.join(
+            [
+                template.format(amount="12.43"),
+                template.format(amount="12.34"),
+                template.format(amount="12.34"),
+            ]
+        )
+        receipts = service_notification_receipts(
+            text,
+            trigger_time=local_timestamp(10, 12),
+            timezone=TIMEZONE,
+        )
+        self.assertEqual(1, len(receipts))
+        self.assertEqual("12.34", receipts[0].amount)
+
+    def test_multipass_ocr_tie_is_not_emitted(self) -> None:
+        transaction_id = "4200000000000000000000000099"
+        template = (
+            "收款通知 01月15日 10:11:12 订单金额 ¥{amount} "
+            f"交易单号 {transaction_id}"
+        )
+        receipts = service_notification_receipts(
+            linux_agent.OCR_CAPTURE_SEPARATOR.join(
+                [
+                    template.format(amount="12.43"),
+                    template.format(amount="12.34"),
+                ]
+            ),
+            trigger_time=local_timestamp(10, 12),
+            timezone=TIMEZONE,
+        )
+        self.assertEqual([], receipts)
 
     def test_same_amount_and_second_keep_distinct_transactions(self) -> None:
         receipts = service_notification_receipts(
@@ -139,6 +180,68 @@ class ServiceNotificationStateTests(unittest.TestCase):
 
 
 class ServiceNotificationCaptureTests(unittest.TestCase):
+    def test_service_ocr_uses_three_independent_renderings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capture = linux_agent.LinuxCapture(
+                {
+                    "capture_dir": directory,
+                    "service_notifications": {
+                        "enabled": True,
+                        "ocr_crop_x": 400,
+                        "ocr_crop_y": 40,
+                        "ocr_crop_width": 580,
+                        "ocr_crop_height": 810,
+                    },
+                },
+                {"_config_dir": directory},
+            )
+            screenshot = Path(directory) / "service-frame.png"
+            screenshot.write_bytes(b"fixture")
+            commands: list[list[str]] = []
+
+            def fake_run(
+                args: list[str],
+                *,
+                timeout: float,
+            ) -> SimpleNamespace:
+                del timeout
+                commands.append(args)
+                if args[0] == capture.convert_tool:
+                    Path(args[-1]).write_bytes(b"rendered")
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"ocr:{Path(args[1]).stem}",
+                    stderr="",
+                )
+
+            with mock.patch.object(capture, "_run", side_effect=fake_run):
+                _path, text, _elapsed_ms, error = capture._ocr_service_frame(
+                    screenshot
+                )
+
+            self.assertIsNone(error)
+            self.assertEqual(3, len((text or "").split(linux_agent.OCR_CAPTURE_SEPARATOR)))
+            convert_commands = [
+                args for args in commands if args[0] == capture.convert_tool
+            ]
+            ocr_commands = [
+                args for args in commands if args[0] == capture.ocr_tool
+            ]
+            self.assertEqual(3, len(convert_commands))
+            self.assertEqual(3, len(ocr_commands))
+            self.assertIn("580x810+400+40", convert_commands[0])
+            self.assertIn("420x810+280+40", convert_commands[1])
+            self.assertIn("420x810+280+40", convert_commands[2])
+            self.assertFalse(
+                any(
+                    path.exists()
+                    for path in Path(directory).glob(
+                        "service-frame-service-ocr-*.png"
+                    )
+                )
+            )
+
     def test_scanner_stops_on_persistent_transaction_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = ServiceNotificationState(

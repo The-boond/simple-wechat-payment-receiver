@@ -501,7 +501,6 @@ def service_notification_receipts(
     """
 
     normalized = normalize_ocr_text(text)
-    headers = list(re.finditer(r"收款通知", normalized))
     timestamp_re = re.compile(
         r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
         r"(?P<hour>\d{1,2}):(?P<minute>\d{2}):(?P<second>\d{2})"
@@ -512,54 +511,48 @@ def service_notification_receipts(
     amount_re = re.compile(
         r"[￥¥YVxX]?(?P<amount>[0-9Oo]{1,6}[.][0-9Oo]{1,2})"
     )
-    receipts: dict[str, ServiceNotificationReceipt] = {}
+    candidates: dict[str, list[ServiceNotificationReceipt]] = {}
     current = datetime.fromtimestamp(trigger_time, timezone)
 
-    for index, header in enumerate(headers):
-        end = headers[index + 1].start() if index + 1 < len(headers) else len(normalized)
-        block = normalized[header.start() : min(end, header.start() + 2600)]
-        timestamp_match = timestamp_re.search(block)
-        if timestamp_match is None:
-            continue
-        transaction_match = transaction_re.search(block, timestamp_match.end())
-        if transaction_match is None:
-            continue
-        transaction_id = transaction_match.group("transaction").translate(
-            str.maketrans({"O": "0", "o": "0"})
-        )
-        if not transaction_id.isdigit():
-            continue
+    for segment in normalized.split(OCR_CAPTURE_SEPARATOR.strip()):
+        segment_headers = list(re.finditer(r"收款通知", segment))
+        for index, header in enumerate(segment_headers):
+            end = (
+                segment_headers[index + 1].start()
+                if index + 1 < len(segment_headers)
+                else len(segment)
+            )
+            block = segment[header.start() : min(end, header.start() + 2600)]
+            timestamp_match = timestamp_re.search(block)
+            if timestamp_match is None:
+                continue
+            transaction_match = transaction_re.search(block, timestamp_match.end())
+            if transaction_match is None:
+                continue
+            transaction_id = transaction_match.group("transaction").translate(
+                str.maketrans({"O": "0", "o": "0"})
+            )
+            if not transaction_id.isdigit():
+                continue
 
-        amount_matches = list(
-            amount_re.finditer(
-                block,
-                timestamp_match.end(),
-                transaction_match.start(),
+            amount_matches = list(
+                amount_re.finditer(
+                    block,
+                    timestamp_match.end(),
+                    transaction_match.start(),
+                )
             )
-        )
-        if not amount_matches:
-            continue
-        try:
-            amount = canonical_money(amount_matches[-1].group("amount"))
-            values = {
-                name: int(timestamp_match.group(name))
-                for name in ("month", "day", "hour", "minute", "second")
-            }
-            stamp = int(
-                datetime(
-                    current.year,
-                    values["month"],
-                    values["day"],
-                    values["hour"],
-                    values["minute"],
-                    values["second"],
-                    tzinfo=timezone,
-                ).timestamp()
-            )
-            if stamp > trigger_time + 86400:
+            if not amount_matches:
+                continue
+            try:
+                amount = canonical_money(amount_matches[-1].group("amount"))
+                values = {
+                    name: int(timestamp_match.group(name))
+                    for name in ("month", "day", "hour", "minute", "second")
+                }
                 stamp = int(
                     datetime(
-                        current.year - 1,
+                        current.year,
                         values["month"],
                         values["day"],
                         values["hour"],
@@ -568,21 +561,49 @@ def service_notification_receipts(
                         tzinfo=timezone,
                     ).timestamp()
                 )
-        except (OverflowError, ValueError):
-            continue
+                if stamp > trigger_time + 86400:
+                    stamp = int(
+                        datetime(
+                            current.year - 1,
+                            values["month"],
+                            values["day"],
+                            values["hour"],
+                            values["minute"],
+                            values["second"],
+                            tzinfo=timezone,
+                        ).timestamp()
+                    )
+            except (OverflowError, ValueError):
+                continue
 
-        receipt = ServiceNotificationReceipt(
-            occurred_at=stamp,
-            amount=amount,
-            external_txn_id=transaction_id,
-            raw_text=block,
+            candidates.setdefault(transaction_id, []).append(
+                ServiceNotificationReceipt(
+                    occurred_at=stamp,
+                    amount=amount,
+                    external_txn_id=transaction_id,
+                    raw_text=block,
+                )
+            )
+
+    receipts: list[ServiceNotificationReceipt] = []
+    for transaction_id, rows in candidates.items():
+        votes: dict[tuple[int, str], list[ServiceNotificationReceipt]] = {}
+        for row in rows:
+            votes.setdefault((row.occurred_at, row.amount), []).append(row)
+        ranked = sorted(
+            votes.values(),
+            key=lambda group: (len(group), max(len(row.raw_text) for row in group)),
+            reverse=True,
         )
-        previous = receipts.get(transaction_id)
-        if previous is None or len(receipt.raw_text) > len(previous.raw_text):
-            receipts[transaction_id] = receipt
+        # Multiple OCR renderings are deliberately reconciled conservatively:
+        # emit only a unique winner. A tie is kept out of the callback path.
+        if len(ranked) > 1 and len(ranked[0]) == len(ranked[1]):
+            continue
+        winner = max(ranked[0], key=lambda row: len(row.raw_text))
+        receipts.append(winner)
 
     return sorted(
-        receipts.values(),
+        receipts,
         key=lambda receipt: (receipt.occurred_at, receipt.external_txn_id),
         reverse=True,
     )

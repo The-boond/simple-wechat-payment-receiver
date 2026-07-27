@@ -463,55 +463,91 @@ class LinuxCapture:
         self,
         screenshot: Path,
     ) -> tuple[Path, str | None, int, str | None]:
-        """OCR only the detailed receipt-card pane of an immutable screenshot."""
+        """OCR the receipt pane with three independent image renderings."""
 
-        enhanced = screenshot.with_name(
-            screenshot.stem + "-service-ocr.png"
+        variants = (
+            (
+                screenshot.with_name(screenshot.stem + "-service-ocr-base.png"),
+                self.service_ocr_crop_x,
+                self.service_ocr_crop_width,
+                ["-resize", "150%"],
+            ),
+            (
+                screenshot.with_name(screenshot.stem + "-service-ocr-sharp.png"),
+                max(0, self.service_ocr_crop_x - 120),
+                max(320, self.service_ocr_crop_width - 160),
+                [
+                    "-colorspace",
+                    "Gray",
+                    "-auto-level",
+                    "-resize",
+                    "220%",
+                    "-unsharp",
+                    "0x1",
+                ],
+            ),
+            (
+                screenshot.with_name(screenshot.stem + "-service-ocr-threshold.png"),
+                max(0, self.service_ocr_crop_x - 120),
+                max(320, self.service_ocr_crop_width - 160),
+                [
+                    "-colorspace",
+                    "Gray",
+                    "-resize",
+                    "220%",
+                    "-threshold",
+                    "78%",
+                ],
+            ),
         )
         started = time.monotonic()
+        texts: list[str] = []
+        errors: list[str] = []
         try:
-            prepared = self._run(
-                [
-                    self.convert_tool,
-                    str(screenshot),
-                    "-crop",
-                    (
-                        f"{self.service_ocr_crop_width}x"
-                        f"{self.service_ocr_crop_height}"
-                        f"+{self.service_ocr_crop_x}+{self.service_ocr_crop_y}"
-                    ),
-                    "+repage",
-                    "-resize",
-                    "150%",
-                    str(enhanced),
-                ],
-                timeout=max(self.capture_timeout, 20),
-            )
-            if prepared.returncode != 0 or not enhanced.exists():
-                return (
-                    screenshot,
-                    None,
-                    int((time.monotonic() - started) * 1000),
-                    prepared.stderr[:500],
+            for enhanced, crop_x, crop_width, filters in variants:
+                prepared = self._run(
+                    [
+                        self.convert_tool,
+                        str(screenshot),
+                        "-crop",
+                        (
+                            f"{crop_width}x"
+                            f"{self.service_ocr_crop_height}"
+                            f"+{crop_x}+{self.service_ocr_crop_y}"
+                        ),
+                        "+repage",
+                        *filters,
+                        str(enhanced),
+                    ],
+                    timeout=max(self.capture_timeout, 20),
                 )
-            result = self._run(
-                [
-                    self.ocr_tool,
-                    str(enhanced),
-                    "stdout",
-                    "-l",
-                    self.ocr_language,
-                    "--psm",
-                    str(self.ocr_psm),
-                ],
-                timeout=self.ocr_timeout,
-            )
+                if prepared.returncode != 0 or not enhanced.exists():
+                    errors.append(prepared.stderr[:500])
+                    continue
+                result = self._run(
+                    [
+                        self.ocr_tool,
+                        str(enhanced),
+                        "stdout",
+                        "-l",
+                        self.ocr_language,
+                        "--psm",
+                        str(self.ocr_psm),
+                    ],
+                    timeout=self.ocr_timeout,
+                )
+                if result.returncode != 0:
+                    errors.append(result.stderr[:500])
+                    continue
+                if result.stdout.strip():
+                    texts.append(result.stdout)
             elapsed_ms = int((time.monotonic() - started) * 1000)
-            if result.returncode != 0:
-                return screenshot, None, elapsed_ms, result.stderr[:500]
-            return screenshot, result.stdout, elapsed_ms, None
+            if not texts:
+                return screenshot, None, elapsed_ms, "; ".join(errors)[:500]
+            return screenshot, OCR_CAPTURE_SEPARATOR.join(texts), elapsed_ms, None
         finally:
-            enhanced.unlink(missing_ok=True)
+            for enhanced, _crop_x, _crop_width, _filters in variants:
+                enhanced.unlink(missing_ok=True)
 
     def capture_service_notifications(
         self,
